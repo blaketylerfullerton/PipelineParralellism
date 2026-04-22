@@ -1,0 +1,18 @@
+pipeline:
+  num_stages: 3
+
+model:
+  name: "gpt2"          # HuggingFace model ID — gpt2 / gpt2-medium / gpt2-large
+  max_new_tokens: 30    # tokens to generate per prompt
+  temperature: 1.0      # sampling temperature (1.0 = greedy-ish, higher = more random)
+
+network:
+  base_port: 5550
+  # For multi-machine: replace with real IPs, one per stage.
+  workers:
+    - "127.0.0.1"
+    - "127.0.0.1"
+    - "127.0.0.1"
+
+dashboard:
+  refresh_rate_hz: 10
