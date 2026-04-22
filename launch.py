@@ -203,12 +203,31 @@ def run_discovery_ui(disc: DiscoveryManager, console: Console) -> None:
             time.sleep(0.25)
 
 
+def _show_static_peers(worker_ips: List[str], my_stage: int, console: Console) -> None:
+    """Show a one-shot panel when IPs are provided manually (no discovery needed)."""
+    lines = Text()
+    for i, ip in enumerate(worker_ips):
+        tag = "  ← this machine" if i == my_stage else ""
+        lines.append(f"  Stage {i}  ", style="bold white")
+        lines.append(f"{ip}{tag} ", style="dim")
+        lines.append("●\n", style="bold green")
+    lines.append("\n  All stages configured — starting pipeline.\n", style="bold green")
+    console.print(Panel(lines, title="[bold green]Peers (manual)", border_style="green", padding=(0, 1)))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Auto-discover peers and run pipeline parallelism"
     )
     parser.add_argument("--stage", type=int, required=True, help="This machine's stage (0-indexed)")
     parser.add_argument("--stages", type=int, default=None, help="Total number of stages (overrides config)")
+    parser.add_argument(
+        "--peer-ip", nargs="+", metavar="IP",
+        help=(
+            "Skip auto-discovery and use these IPs directly, listed in stage order. "
+            "Example (2 machines): --peer-ip 172.16.0.162 192.168.1.66"
+        ),
+    )
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt (Stage 0 only)")
     parser.add_argument("--config", type=str, default="config.yaml")
     args = parser.parse_args()
@@ -234,14 +253,21 @@ def main() -> None:
         f"Stages [cyan]{num_stages}[/]"
     )
 
-    # --- Discovery phase ---
-    disc = DiscoveryManager(args.stage, num_stages, my_ip, hostname)
-    disc.start()
-    run_discovery_ui(disc, console)
-    disc.stop()
+    # --- Discovery or manual IP phase ---
+    if args.peer_ip:
+        if len(args.peer_ip) != num_stages:
+            raise SystemExit(
+                f"--peer-ip needs exactly {num_stages} IPs (one per stage), got {len(args.peer_ip)}: {args.peer_ip}"
+            )
+        ips = args.peer_ip
+        _show_static_peers(ips, args.stage, console)
+    else:
+        disc = DiscoveryManager(args.stage, num_stages, my_ip, hostname)
+        disc.start()
+        run_discovery_ui(disc, console)
+        disc.stop()
+        ips = disc.worker_ips()
 
-    # Populate config with discovered worker IPs
-    ips = disc.worker_ips()
     config["network"]["workers"] = ips
     console.print(f"\n  Workers: {dict(enumerate(ips))}")
 
