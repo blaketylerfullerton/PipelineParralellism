@@ -112,7 +112,7 @@ launch.py
 Requires Python 3.10+ on each machine.
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/blaketylerfullerton/PipelineParralellism
 cd PipeLineParralel
 python3 -m venv .venv
 source .venv/bin/activate
