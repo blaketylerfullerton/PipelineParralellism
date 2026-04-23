@@ -91,7 +91,12 @@ def bytes_to_tensor(data: bytes, shape: tuple, dtype_str: str, requires_grad: bo
 
 # --- Message constructors ---
 
-def make_activation_msg(micro_batch_id: int, stage_id: int, tensor: torch.Tensor) -> bytes:
+def make_activation_msg(
+    micro_batch_id: int,
+    stage_id: int,
+    tensor: torch.Tensor,
+    is_prefill: bool = False,
+) -> bytes:
     raw, shape, dtype = tensor_to_bytes(tensor)
     msg = {
         "msg_type": "activation",
@@ -100,6 +105,7 @@ def make_activation_msg(micro_batch_id: int, stage_id: int, tensor: torch.Tensor
         "tensor": raw,
         "shape": shape,
         "dtype": dtype,
+        "is_prefill": is_prefill,
         "timestamp_sent": time.time(),
     }
     return pickle.dumps(msg)

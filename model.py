@@ -1,12 +1,8 @@
 import torch
 import torch.nn as nn
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
-
-
-def _run_block(block: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
-    """Call a GPT-2 transformer block, handling both tuple (<=4.x) and tensor (>=5.x) return formats."""
-    out = block(hidden)
-    return out[0] if isinstance(out, tuple) else out
+from transformers.cache_utils import DynamicCache
+from typing import Optional, Tuple
 
 
 class Stage0Module(nn.Module):
@@ -19,13 +15,24 @@ class Stage0Module(nn.Module):
         self.drop = transformer.drop
         self.blocks = nn.ModuleList(list(transformer.h)[:num_blocks])
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values: Optional[DynamicCache] = None,
+    ) -> Tuple[torch.Tensor, DynamicCache]:
         seq_len = input_ids.shape[1]
-        pos_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
+        # Offset positional IDs by the number of tokens already cached.
+        past_len = past_key_values.get_seq_length() if past_key_values is not None else 0
+        pos_ids = torch.arange(past_len, past_len + seq_len, device=input_ids.device).unsqueeze(0)
         hidden = self.drop(self.wte(input_ids) + self.wpe(pos_ids))
+
+        if past_key_values is None:
+            past_key_values = DynamicCache()
+
         for block in self.blocks:
-            hidden = _run_block(block, hidden)
-        return hidden
+            hidden = block(hidden, past_key_values=past_key_values, use_cache=True)
+
+        return hidden, past_key_values
 
 
 class MiddleModule(nn.Module):
@@ -35,10 +42,18 @@ class MiddleModule(nn.Module):
         super().__init__()
         self.blocks = nn.ModuleList(blocks)
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        past_key_values: Optional[DynamicCache] = None,
+    ) -> Tuple[torch.Tensor, DynamicCache]:
+        if past_key_values is None:
+            past_key_values = DynamicCache()
+
         for block in self.blocks:
-            hidden = _run_block(block, hidden)
-        return hidden
+            hidden = block(hidden, past_key_values=past_key_values, use_cache=True)
+
+        return hidden, past_key_values
 
 
 class LastModule(nn.Module):
@@ -50,10 +65,18 @@ class LastModule(nn.Module):
         self.ln_f = ln_f
         self.lm_head = lm_head
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        past_key_values: Optional[DynamicCache] = None,
+    ) -> Tuple[torch.Tensor, DynamicCache]:
+        if past_key_values is None:
+            past_key_values = DynamicCache()
+
         for block in self.blocks:
-            hidden = _run_block(block, hidden)
-        return self.lm_head(self.ln_f(hidden))
+            hidden = block(hidden, past_key_values=past_key_values, use_cache=True)
+
+        return self.lm_head(self.ln_f(hidden)), past_key_values
 
 
 def _block_slices(num_blocks: int, num_stages: int) -> list:
