@@ -18,6 +18,7 @@ Optional:
 import argparse
 import json
 import socket
+import subprocess
 import threading
 import time
 from typing import Dict, List, Optional
@@ -35,10 +36,52 @@ from utils import load_config
 DISCOVERY_PORT = 5599
 PEER_TIMEOUT = 6.0      # seconds before marking a peer as offline
 READY_HOLD = 2.0        # seconds all peers must be present before auto-start
+TAILSCALE_REFRESH = 10.0  # how often to re-query Tailscale peer list
+
+
+def _get_tailscale_ip() -> Optional[str]:
+    """Return this machine's Tailscale IP, or None if Tailscale isn't running."""
+    candidates = ["tailscale", "/usr/bin/tailscale", "/usr/sbin/tailscale",
+                  "/usr/local/bin/tailscale", "/snap/bin/tailscale"]
+    for binary in candidates:
+        try:
+            result = subprocess.run(
+                [binary, "ip", "-4"],
+                capture_output=True, text=True, timeout=3
+            )
+            if result.returncode == 0:
+                ip = result.stdout.strip()
+                if ip:
+                    return ip
+        except Exception:
+            continue
+    return None
+
+
+def _get_tailscale_peer_ips() -> List[str]:
+    """Return IPs of currently-online Tailscale peers."""
+    try:
+        result = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True, text=True, timeout=3
+        )
+        if result.returncode != 0:
+            return []
+        data = json.loads(result.stdout)
+        peers = []
+        for peer in data.get("Peer", {}).values():
+            if peer.get("Online") and peer.get("TailscaleIPs"):
+                peers.append(peer["TailscaleIPs"][0])
+        return peers
+    except Exception:
+        return []
 
 
 def get_local_ip() -> str:
-    """Detect this machine's LAN IP (no packet actually sent)."""
+    """Return this machine's best reachable IP — Tailscale if available, else LAN."""
+    ts_ip = _get_tailscale_ip()
+    if ts_ip:
+        return ts_ip
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
@@ -64,6 +107,8 @@ class DiscoveryManager:
             my_stage: {"ip": my_ip, "hostname": hostname, "last_seen": time.time()}
         }
         self._running = False
+        self._tailscale_peers: List[str] = []
+        self._tailscale_last_refresh: float = 0.0
 
     def start(self) -> None:
         self._running = True
@@ -98,10 +143,25 @@ class DiscoveryManager:
             "hostname": self.hostname,
         }).encode()
         while self._running:
+            # LAN broadcast (same-subnet peers)
             try:
                 sock.sendto(msg, ("255.255.255.255", DISCOVERY_PORT))
             except Exception:
                 pass
+
+            # Refresh Tailscale peer list periodically
+            now = time.time()
+            if now - self._tailscale_last_refresh > TAILSCALE_REFRESH:
+                self._tailscale_peers = _get_tailscale_peer_ips()
+                self._tailscale_last_refresh = now
+
+            # Unicast to each Tailscale peer (works across subnets/VPN)
+            for peer_ip in self._tailscale_peers:
+                try:
+                    sock.sendto(msg, (peer_ip, DISCOVERY_PORT))
+                except Exception:
+                    pass
+
             time.sleep(0.8)
         sock.close()
 
