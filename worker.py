@@ -107,12 +107,17 @@ def generation_loop(
         _dash_update(state="running", current_step=0)
 
         times = []
+        stage_kv = None
         for step in range(max_new_tokens):
+            is_prefill = step == 0
+            # Prefill: full sequence. Decode: only the last (new) token.
+            feed = generated if is_prefill else generated[:, -1:]
+
             t0 = time.perf_counter()
             with torch.no_grad():
-                hidden = stage_model(generated)
+                hidden, stage_kv = stage_model(feed, past_key_values=stage_kv)
 
-            send_msg(sockets["push"], make_activation_msg(step, 0, hidden))
+            send_msg(sockets["push"], make_activation_msg(step, 0, hidden, is_prefill=is_prefill))
             _dash_update(state="forward", current_step=step)
             _publish(sockets["pub"], 0, host, step, "forward", 0, step)
 
@@ -147,10 +152,14 @@ def generation_loop(
 
         times = []
         step = 0
+        stage_kv = None
         while True:
             msg = recv_msg(sockets["pull"], timeout_ms=60_000)
             if msg is None or msg["msg_type"] == "end_of_generation":
                 break
+
+            if msg.get("is_prefill", True):
+                stage_kv = None  # reset KV cache at the start of each generation
 
             hidden = bytes_to_tensor(msg["tensor"], msg["shape"], msg["dtype"])
             _dash_update(state="forward", current_step=step)
@@ -158,7 +167,7 @@ def generation_loop(
 
             t0 = time.perf_counter()
             with torch.no_grad():
-                logits = stage_model(hidden)          # (1, seq_len, vocab_size)
+                logits, stage_kv = stage_model(hidden, past_key_values=stage_kv)
 
             # Sample next token from final position
             last_logits = logits[:, -1, :] / max(temperature, 1e-6)
@@ -187,11 +196,16 @@ def generation_loop(
 
         times = []
         step = 0
+        stage_kv = None
         while True:
             msg = recv_msg(sockets["pull"], timeout_ms=60_000)
             if msg is None or msg["msg_type"] == "end_of_generation":
                 send_msg(sockets["push"], make_control_msg("end_of_generation"))
                 break
+
+            is_prefill = msg.get("is_prefill", True)
+            if is_prefill:
+                stage_kv = None  # reset KV cache at the start of each generation
 
             hidden = bytes_to_tensor(msg["tensor"], msg["shape"], msg["dtype"])
             _dash_update(state="forward", current_step=step)
@@ -199,11 +213,11 @@ def generation_loop(
 
             t0 = time.perf_counter()
             with torch.no_grad():
-                out = stage_model(hidden)
+                out, stage_kv = stage_model(hidden, past_key_values=stage_kv)
             elapsed = (time.perf_counter() - t0) * 1000
             times.append(elapsed)
 
-            send_msg(sockets["push"], make_activation_msg(step, stage_id, out))
+            send_msg(sockets["push"], make_activation_msg(step, stage_id, out, is_prefill=is_prefill))
 
             print(f"[Stage {stage_id}] Step {step:3d}  shape={tuple(hidden.shape)} → {tuple(out.shape)}  {elapsed:.1f}ms")
             _dash_update(state="forward", current_step=step, elapsed_ms=elapsed)
