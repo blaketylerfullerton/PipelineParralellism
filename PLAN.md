@@ -20,15 +20,32 @@ Per-token latency = 2 × compute + 2 × (network RTT + serialization). Every hop
 
 ## Phase 1 — Free wins (do these first, days of work, 5–10x speedup)
 
-### 1.1 KV cache
+### ~~1.1 KV cache~~ ✅ DONE
 
-**Biggest single win.** Currently `worker.py:113` and `worker.py:161` re-run the full sequence every step, so step N costs O(N²) compute and the hidden state you send grows every step (serialization cost grows too).
+~~**Biggest single win.** Currently `worker.py:113` and `worker.py:161` re-run the full sequence every step, so step N costs O(N²) compute and the hidden state you send grows every step (serialization cost grows too).~~
 
-- Switch `model.py` stage modules to use HuggingFace `past_key_values` or roll your own cache per layer.
-- After step 0, only send the hidden state for the **last token** across the wire — shape drops from `(1, N, 768)` to `(1, 1, 768)`. Network payload shrinks ~30x over a 30-token generation.
-- Last stage keeps its own KV cache for blocks 6–11.
+~~- Switch `model.py` stage modules to use HuggingFace `past_key_values` or roll your own cache per layer.~~
+~~- After step 0, only send the hidden state for the **last token** across the wire — shape drops from `(1, N, 768)` to `(1, 1, 768)`. Network payload shrinks ~30x over a 30-token generation.~~
+~~- Last stage keeps its own KV cache for blocks 6–11.~~
 
-Expected: 3–5x TPS even before touching the network.
+~~Expected: 3–5x TPS even before touching the network.~~
+
+**What we did:** Updated `model.py` to use HuggingFace `DynamicCache` (transformers 5.x API) in all three stage modules (`Stage0Module`, `MiddleModule`, `LastModule`). Each block is called with `past_key_values=cache, use_cache=True` — the cache mutates in place and accumulates K/V tensors across steps. `Stage0Module` offsets positional IDs by `cache.get_seq_length()` so decode steps land at the correct position. Added `is_prefill` flag to activation messages in `utils.py` so downstream stages know when to reset their cache. In `worker.py`, Stage 0 feeds the full sequence on step 0 then only `generated[:, -1:]` (1 token) on every subsequent step; all other stages maintain their own `DynamicCache` and reset it on `is_prefill=True`.
+
+**Result:** Hidden state transmitted over the wire drops from `(1, N, 768)` to `(1, 1, 768)` after the first step — ~30x smaller payload on a 30-token generation. Compute drops from O(N²) to O(N) amortized.
+
+| | Before | After |
+|---|---|---|
+| ms / token | 192 ms | 112 ms |
+| speedup | — | 1.7× |
+
+**Before (no KV cache):**
+
+![Before KV cache](images/before_kv.png)
+
+**After (KV cache):**
+
+![After KV cache](images/after_kv.png)
 
 ### 1.2 Activation compression on the wire
 
@@ -152,7 +169,7 @@ Tradeoff: you lose the educational from-scratch aspect of this repo, but you gai
 | Phase | Effort | Speedup on top of previous | Cumulative TPS target (70B-class, 3 machines, 40ms RTT) |
 |---|---|---|---|
 | Baseline (current code) | — | 1x | ~0.3 TPS |
-| 1.1 KV cache | 2–3 days | 3–5x | ~1 TPS |
+| ~~1.1 KV cache~~ ✅ | 2–3 days | 1.7× measured (192→112 ms/tok) | ~1 TPS |
 | 1.2 int8 activations | 1 day | 1.3x | ~1.3 TPS |
 | 1.3 Async overlap | 2 days | 1.3x | ~1.7 TPS |
 | 2. Speculative decoding | 1–2 weeks | 3–5x | ~5 TPS |
