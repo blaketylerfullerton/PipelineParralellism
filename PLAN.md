@@ -47,15 +47,25 @@ Per-token latency = 2 × compute + 2 × (network RTT + serialization). Every hop
 
 ![After KV cache](images/after_kv.png)
 
-### 1.2 Activation compression on the wire
+### ~~1.2 Activation compression on the wire~~ ✅ DONE
 
-At `utils.py` in `make_activation_msg` / `bytes_to_tensor`: currently sends raw fp32 bytes. For GPT-2 medium that's `768 × 4 = 3072 bytes/token` (tolerable). For 70B-class models hidden-dim is 8192 → 32KB/token in fp32. Serialization cost dominates at that size.
+~~At `utils.py` in `make_activation_msg` / `bytes_to_tensor`: currently sends raw fp32 bytes. For GPT-2 medium that's `768 × 4 = 3072 bytes/token` (tolerable). For 70B-class models hidden-dim is 8192 → 32KB/token in fp32. Serialization cost dominates at that size.~~
 
-- fp16 cast before `tobytes()`: 2x free.
-- int8 per-token quantization with a scalar scale: 4x, <0.05 perplexity hit.
-- int4 with per-group scales (16-elem groups): 8x, ~0.1 perplexity hit, only worth it at scale.
+~~- fp16 cast before `tobytes()`: 2x free.~~
+~~- int8 per-token quantization with a scalar scale: 4x, <0.05 perplexity hit.~~
+~~- int4 with per-group scales (16-elem groups): 8x, ~0.1 perplexity hit, only worth it at scale.~~
 
-Implement as a pluggable codec in `utils.py` (`encode_activation(tensor, mode)` / `decode_activation(...)`), config-driven via `config.yaml`.
+~~Implement as a pluggable codec in `utils.py` (`encode_activation(tensor, mode)` / `decode_activation(...)`), config-driven via `config.yaml`.~~
+
+**What we did:** Added `encode_activation(tensor, mode)` / `decode_activation(encoded)` / `tensor_from_activation_msg(msg)` to `utils.py`. Three modes — `fp32` (baseline), `fp16` (2x), `int8` (4x, per-tensor scale). `make_activation_msg` now accepts a `codec` param. `worker.py` reads `compression.mode` from `config.yaml` and passes it through. All hidden-state sends use the configured codec; the token-return channel (single int) stays fp32. `config.yaml` defaults to `int8`.
+
+**Measured round-trip error (GPT-2 medium, hidden=768):**
+
+| codec | bytes/token | max error |
+|---|---|---|
+| fp32 | 3072 | 0 |
+| fp16 | 1536 (2×) | 0.001 |
+| int8 | 768 (4×) | 0.013 |
 
 ### 1.3 Overlap send with compute
 
@@ -170,7 +180,7 @@ Tradeoff: you lose the educational from-scratch aspect of this repo, but you gai
 |---|---|---|---|
 | Baseline (current code) | — | 1x | ~0.3 TPS |
 | ~~1.1 KV cache~~ ✅ | 2–3 days | 1.7× measured (192→112 ms/tok) | ~1 TPS |
-| 1.2 int8 activations | 1 day | 1.3x | ~1.3 TPS |
+| ~~1.2 int8 activations~~ ✅ | 1 day | 1.3x | ~1.3 TPS |
 | 1.3 Async overlap | 2 days | 1.3x | ~1.7 TPS |
 | 2. Speculative decoding | 1–2 weeks | 3–5x | ~5 TPS |
 | 3. MoE architecture | 2–4 weeks | 1.5–2x | ~8 TPS |

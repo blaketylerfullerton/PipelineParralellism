@@ -89,6 +89,40 @@ def bytes_to_tensor(data: bytes, shape: tuple, dtype_str: str, requires_grad: bo
     return t
 
 
+# --- Activation codec ---
+
+def encode_activation(tensor: torch.Tensor, mode: str) -> dict:
+    """Encode tensor for wire transmission. Returns codec fields to embed in a message."""
+    if mode == "fp16":
+        arr = tensor.detach().cpu().to(torch.float16).numpy()
+        return {"codec": "fp16", "data": arr.tobytes(), "shape": arr.shape, "dtype": arr.dtype.str}
+    if mode == "int8":
+        t = tensor.detach().cpu().float()
+        scale = float(t.abs().max()) / 127.0 or 1.0
+        q = (t / scale).round().clamp(-127, 127).to(torch.int8)
+        arr = q.numpy()
+        return {"codec": "int8", "data": arr.tobytes(), "shape": arr.shape, "dtype": arr.dtype.str, "scale": scale}
+    # fp32 (default)
+    arr = tensor.detach().cpu().float().numpy()
+    return {"codec": "fp32", "data": arr.tobytes(), "shape": arr.shape, "dtype": arr.dtype.str}
+
+
+def decode_activation(encoded: dict) -> torch.Tensor:
+    """Decode a tensor from a codec dict (as embedded in an activation message)."""
+    arr = np.frombuffer(encoded["data"], dtype=np.dtype(encoded["dtype"])).reshape(encoded["shape"]).copy()
+    t = torch.from_numpy(arr)
+    if encoded.get("codec") == "int8":
+        return t.float() * encoded["scale"]
+    if encoded.get("codec") == "fp16":
+        return t.float()
+    return t
+
+
+def tensor_from_activation_msg(msg: dict) -> torch.Tensor:
+    """Decode the hidden-state tensor from a received activation message."""
+    return decode_activation(msg)
+
+
 # --- Message constructors ---
 
 def make_activation_msg(
@@ -96,17 +130,16 @@ def make_activation_msg(
     stage_id: int,
     tensor: torch.Tensor,
     is_prefill: bool = False,
+    codec: str = "fp32",
 ) -> bytes:
-    raw, shape, dtype = tensor_to_bytes(tensor)
+    encoded = encode_activation(tensor, codec)
     msg = {
         "msg_type": "activation",
         "micro_batch_id": micro_batch_id,
         "stage_id": stage_id,
-        "tensor": raw,
-        "shape": shape,
-        "dtype": dtype,
         "is_prefill": is_prefill,
         "timestamp_sent": time.time(),
+        **encoded,
     }
     return pickle.dumps(msg)
 
