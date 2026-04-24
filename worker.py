@@ -9,7 +9,6 @@ import zmq
 from dashboard import get_dashboard, init_dashboard
 from model import get_stage, get_tokenizer
 from utils import (
-    bytes_to_tensor,
     get_forward_port,
     get_telemetry_port,
     get_token_return_port,
@@ -21,6 +20,7 @@ from utils import (
     make_push_socket,
     recv_msg,
     send_msg,
+    tensor_from_activation_msg,
 )
 
 
@@ -86,6 +86,7 @@ def generation_loop(
 ) -> None:
     max_new_tokens = config["model"].get("max_new_tokens", 20)
     temperature = config["model"].get("temperature", 1.0)
+    codec = config.get("compression", {}).get("mode", "fp32")
     dash = get_dashboard()
 
     def _dash_update(**kwargs):
@@ -117,7 +118,7 @@ def generation_loop(
             with torch.no_grad():
                 hidden, stage_kv = stage_model(feed, past_key_values=stage_kv)
 
-            send_msg(sockets["push"], make_activation_msg(step, 0, hidden, is_prefill=is_prefill))
+            send_msg(sockets["push"], make_activation_msg(step, 0, hidden, is_prefill=is_prefill, codec=codec))
             _dash_update(state="forward", current_step=step)
             _publish(sockets["pub"], 0, host, step, "forward", 0, step)
 
@@ -126,7 +127,7 @@ def generation_loop(
             while msg is None:
                 msg = recv_msg(sockets["token_pull"], timeout_ms=60_000)
 
-            next_token = bytes_to_tensor(msg["tensor"], msg["shape"], msg["dtype"]).long()
+            next_token = tensor_from_activation_msg(msg).long()
             generated = torch.cat([generated, next_token], dim=-1)
 
             word = tokenizer.decode(next_token[0])
@@ -161,7 +162,7 @@ def generation_loop(
             if msg.get("is_prefill", True):
                 stage_kv = None  # reset KV cache at the start of each generation
 
-            hidden = bytes_to_tensor(msg["tensor"], msg["shape"], msg["dtype"])
+            hidden = tensor_from_activation_msg(msg)
             _dash_update(state="forward", current_step=step)
             _publish(sockets["pub"], stage_id, host, step, "forward", 0, step)
 
@@ -207,7 +208,7 @@ def generation_loop(
             if is_prefill:
                 stage_kv = None  # reset KV cache at the start of each generation
 
-            hidden = bytes_to_tensor(msg["tensor"], msg["shape"], msg["dtype"])
+            hidden = tensor_from_activation_msg(msg)
             _dash_update(state="forward", current_step=step)
             _publish(sockets["pub"], stage_id, host, step, "forward", 0, step)
 
@@ -217,7 +218,7 @@ def generation_loop(
             elapsed = (time.perf_counter() - t0) * 1000
             times.append(elapsed)
 
-            send_msg(sockets["push"], make_activation_msg(step, stage_id, out, is_prefill=is_prefill))
+            send_msg(sockets["push"], make_activation_msg(step, stage_id, out, is_prefill=is_prefill, codec=codec))
 
             print(f"[Stage {stage_id}] Step {step:3d}  shape={tuple(hidden.shape)} → {tuple(out.shape)}  {elapsed:.1f}ms")
             _dash_update(state="forward", current_step=step, elapsed_ms=elapsed)
