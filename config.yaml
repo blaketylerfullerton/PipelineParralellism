@@ -2,7 +2,7 @@ pipeline:
   num_stages: 3
 
 model:
-  name: "gpt2"          # HuggingFace model ID — gpt2 / gpt2-medium / gpt2-large
+  name: "gpt2-large"    # HuggingFace model ID — gpt2 / gpt2-medium / gpt2-large
   max_new_tokens: 30    # tokens to generate per prompt
   temperature: 1.0      # sampling temperature (1.0 = greedy-ish, higher = more random)
 
@@ -15,7 +15,7 @@ network:
     - "127.0.0.1"
 
 compression:
-  mode: "int8"  # fp32 | fp16 | int8
+  mode: "fp16"  # fp32 | fp16 | int8
 
 speculative:
   enabled: true
