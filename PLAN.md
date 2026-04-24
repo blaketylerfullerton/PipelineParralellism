@@ -67,6 +67,10 @@ Per-token latency = 2 × compute + 2 × (network RTT + serialization). Every hop
 | fp16 | 1536 (2×) | 0.001 |
 | int8 | 768 (4×) | 0.013 |
 
+
+![After Adding Compression](images/after_compression.png)
+
+
 ### 1.3 Overlap send with compute
 
 Stage 0 currently sends hidden state, then blocks waiting for the returned token before starting the next forward. Stage 1 is idle while Stage 0 computes and vice versa — classic pipeline bubble.
