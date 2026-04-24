@@ -71,6 +71,23 @@ Per-token latency = 2 × compute + 2 × (network RTT + serialization). Every hop
 ![After Adding Compression](images/after_compression.png)
 
 
+### 1.2.5 Model architecture note — switching to Llama/Mistral 7B+
+
+When we move to a real model, the pipeline infrastructure (`worker.py`, `utils.py`, `launch.py`, codec, KV cache, sockets) needs **zero changes** — it's already model-agnostic. The only file that needs work is `model.py`.
+
+**What's GPT-2 specific today:**
+- `Stage0Module` references `transformer.wte`, `transformer.wpe`, `transformer.drop` and manually adds positional embeddings in `forward` — Llama has no `wpe`, RoPE is computed inside each attention layer
+- `MiddleModule` / `LastModule` reference `transformer.h`, `transformer.ln_f`
+- `get_stage` / `get_tokenizer` hardcode `GPT2LMHeadModel` / `GPT2Tokenizer`
+
+**Plan when the time comes:**
+- Add `get_stage_llama(stage_id, num_stages, config)` alongside the existing `get_stage()` — new stage classes that reference `model.model.embed_tokens`, `model.model.layers`, `model.model.norm`
+- `Stage0Module.forward` simplifies to `hidden = embed_tokens(input_ids)` — no positional addition
+- Switch `get_stage` / `get_tokenizer` to `AutoModelForCausalLM` / `AutoTokenizer`, select stage builder via `config.model.arch` (`gpt2` vs `llama`)
+- Memory: 7B fp16 = ~14GB total → ~7GB per machine with 2 stages, fits in 16GB RAM
+
+Do this when Phase 2 (speculative decoding) is proven out, before Phase 3 (MoE). The draft model in `draft.py` will also need a Llama-compatible version at that point.
+
 ### 1.3 Overlap send with compute
 
 Stage 0 currently sends hidden state, then blocks waiting for the returned token before starting the next forward. Stage 1 is idle while Stage 0 computes and vice versa — classic pipeline bubble.
