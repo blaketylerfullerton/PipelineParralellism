@@ -1,5 +1,5 @@
 import torch
-from transformers import GPT2LMHeadModel
+from transformers import AutoModelForCausalLM
 from transformers.cache_utils import DynamicCache
 
 from utils import trim_dynamic_cache
@@ -10,7 +10,7 @@ class DraftModel:
 
     def __init__(self, model_name: str, temperature: float = 1.0):
         print(f"  [Draft] Loading {model_name}...")
-        self.model = GPT2LMHeadModel.from_pretrained(model_name)
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32)
         self.model.eval()
         self.temperature = temperature
         self._kv: DynamicCache = None
