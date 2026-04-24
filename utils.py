@@ -2,6 +2,8 @@ import pickle
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from transformers.cache_utils import DynamicCache
+
 import numpy as np
 import torch
 import yaml
@@ -125,12 +127,18 @@ def tensor_from_activation_msg(msg: dict) -> torch.Tensor:
 
 # --- Message constructors ---
 
+def trim_dynamic_cache(cache: DynamicCache, keep_len: int) -> None:
+    """Trim a DynamicCache in-place to keep_len sequence positions."""
+    cache.crop(keep_len)
+
+
 def make_activation_msg(
     micro_batch_id: int,
     stage_id: int,
     tensor: torch.Tensor,
     is_prefill: bool = False,
     codec: str = "fp32",
+    draft_tokens: Optional[List[int]] = None,
 ) -> bytes:
     encoded = encode_activation(tensor, codec)
     msg = {
@@ -138,8 +146,26 @@ def make_activation_msg(
         "micro_batch_id": micro_batch_id,
         "stage_id": stage_id,
         "is_prefill": is_prefill,
+        "draft_tokens": draft_tokens,  # list of K ints (spec mode) or None
         "timestamp_sent": time.time(),
         **encoded,
+    }
+    return pickle.dumps(msg)
+
+
+def make_spec_result_msg(step: int, target_probs: list, target_samples: list) -> bytes:
+    """
+    Sent by last stage → Stage 0 in speculative mode.
+    target_probs: [K] floats — p(draft_i | context) for each draft position.
+    target_samples: [K+1] ints — one sampled token per position (for rejection fallback + bonus).
+    For prefill: target_probs=[], target_samples=[first_token].
+    """
+    msg = {
+        "msg_type": "spec_result",
+        "step": step,
+        "target_probs": target_probs,
+        "target_samples": target_samples,
+        "timestamp_sent": time.time(),
     }
     return pickle.dumps(msg)
 

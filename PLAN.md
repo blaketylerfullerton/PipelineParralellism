@@ -105,7 +105,7 @@ Stage 0 currently sends hidden state, then blocks waiting for the returned token
 
 ---
 
-## Phase 2 — Speculative decoding (the single biggest lever, 1–2 weeks)
+## ~~Phase 2 — Speculative decoding~~ ✅ DONE
 
 This is the technique that makes WAN pipeline parallelism actually work. Don't skip it.
 
@@ -203,7 +203,7 @@ Tradeoff: you lose the educational from-scratch aspect of this repo, but you gai
 | ~~1.1 KV cache~~ ✅ | 2–3 days | 1.7× measured (192→112 ms/tok) | ~1 TPS |
 | ~~1.2 int8 activations~~ ✅ | 1 day | 1.3x | ~1.3 TPS |
 | 1.3 Async overlap | 2 days | 1.3x | ~1.7 TPS |
-| 2. Speculative decoding | 1–2 weeks | 3–5x | ~5 TPS |
+| ~~2. Speculative decoding~~ ✅ | 1–2 weeks | measured with same-model test | ~5 TPS |
 | 3. MoE architecture | 2–4 weeks | 1.5–2x | ~8 TPS |
 | 4.2 Cascade (optional) | 3 days | 1.5x | ~12 TPS |
 
