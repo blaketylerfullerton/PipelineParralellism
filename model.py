@@ -227,7 +227,7 @@ _DTYPE_MAP = {
 }
 
 
-def _resolve_dtype(config: dict):
+def resolve_dtype(config: dict):
     name = str(config["model"].get("dtype", "fp32")).lower()
     if name not in _DTYPE_MAP:
         raise ValueError(f"Unknown model.dtype '{name}' — use fp32 / fp16 / bf16")
@@ -262,7 +262,7 @@ def _get_stage_gpt2(stage_id: int, num_stages: int, config: dict) -> nn.Module:
 
 def _get_stage_llama(stage_id: int, num_stages: int, config: dict) -> nn.Module:
     model_name = config["model"]["name"]
-    dtype = _resolve_dtype(config)
+    dtype = resolve_dtype(config)
     print(f"  Loading {model_name} ({dtype}) — stage {stage_id}/{num_stages - 1}...")
     full = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype)
     full.eval()

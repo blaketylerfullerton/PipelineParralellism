@@ -8,9 +8,9 @@ from utils import trim_dynamic_cache
 class DraftModel:
     """Small local draft model for speculative decoding (runs entirely on Stage 0)."""
 
-    def __init__(self, model_name: str, temperature: float = 1.0):
+    def __init__(self, model_name: str, temperature: float = 1.0, torch_dtype: torch.dtype = torch.float32):
         print(f"  [Draft] Loading {model_name}...")
-        self.model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32)
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch_dtype)
         self.model.eval()
         self.temperature = temperature
         self._kv: DynamicCache = None
