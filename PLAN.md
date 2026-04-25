@@ -85,9 +85,9 @@ Per-token latency = 2 × compute + 2 × (network RTT + serialization). Every hop
 ~~- While Stage 0 waits on `token_pull`, let it start *speculative* work on the next step (see Phase 2).~~
 ~~- Better: switch to `asyncio` + `zmq.asyncio` so the generation loop is a coroutine that can overlap I/O with compute.~~
 
-**What we did:** Two changes. (1) Raised `ZMQ_SNDBUF`/`ZMQ_RCVBUF` to 4 MB on all push/pull sockets in `utils.py` — reduces latency jitter on WAN links without any code-path changes. (2) Added `AsyncSender` class to `utils.py`: a daemon thread that drains a queue of pre-serialized messages and calls `socket.send()`, returning immediately to the caller. All outbound sends in `worker.py` — hidden-state activations, control messages (`trim_cache`, `end_of_generation`), and token-return messages — now go through `AsyncSender`. The compute thread queues the send and immediately proceeds to the next `recv_msg` without blocking on pickle+compression+socket.send.
+**What we did:** Raised `ZMQ_SNDBUF`/`ZMQ_RCVBUF` to 4 MB on all push/pull sockets in `utils.py` — reduces latency jitter on WAN links and increases throughput headroom for larger hidden dims.
 
-The net effect: `encode_activation` (int8 quantization + tobytes) and `pickle.dumps` are now off the critical path between compute and recv. For current model sizes (hidden=3072, 1 token, int8) this saves ~2–5 ms/step. The benefit grows with hidden dimension — at 8192 (7B-class) it saves ~8–15 ms/step. More importantly, this architecture is the required groundwork for Phase 3's scatter-gather MoE routing, which needs non-blocking sends.
+Note: a background-thread `AsyncSender` approach was attempted to overlap serialization with compute, but ZMQ sockets are not thread-safe — using a socket from any thread other than the one that created it causes severe performance degradation (5x TPS regression observed). The correct approach for true async sends is `asyncio` + `zmq.asyncio`, deferred to Phase 3 where it's needed for MoE scatter-gather routing anyway.
 
 ### 1.4 Network-layer tuning
 
