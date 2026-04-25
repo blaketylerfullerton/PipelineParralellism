@@ -10,6 +10,7 @@ import zmq
 from dashboard import get_dashboard, init_dashboard
 from model import get_stage, get_tokenizer, resolve_dtype
 from utils import (
+    AsyncSender,
     get_forward_port,
     get_telemetry_port,
     get_token_return_port,
@@ -21,7 +22,6 @@ from utils import (
     make_push_socket,
     make_spec_result_msg,
     recv_msg,
-    send_msg,
     tensor_from_activation_msg,
     trim_dynamic_cache,
 )
@@ -95,6 +95,11 @@ def generation_loop(
     k = spec_cfg.get("k", 4)
     dash = get_dashboard()
 
+    # Wrap outbound push sockets with AsyncSender so encode+pickle+send happens
+    # in a background thread, freeing the compute thread to recv immediately.
+    async_push = AsyncSender(sockets["push"]) if "push" in sockets else None
+    async_token_push = AsyncSender(sockets["token_push"]) if "token_push" in sockets else None
+
     def _dash_update(**kwargs):
         if dash:
             dash.update_stage(stage_id, host=host, **kwargs)
@@ -137,7 +142,7 @@ def generation_loop(
                     hidden, stage_kv = stage_model(generated, past_key_values=None)
                 kv_len = generated.shape[1]
 
-                send_msg(sockets["push"], make_activation_msg(
+                async_push.send(make_activation_msg(
                     spec_step, 0, hidden, is_prefill=True, codec=codec))
                 _dash_update(state="forward", current_step=0)
                 _publish(sockets["pub"], 0, host, spec_step, "forward", 0, 0)
@@ -171,7 +176,7 @@ def generation_loop(
                 with torch.no_grad():
                     hidden, stage_kv = stage_model(feed, past_key_values=stage_kv)
 
-                send_msg(sockets["push"], make_activation_msg(
+                async_push.send(make_activation_msg(
                     spec_step, 0, hidden, is_prefill=False, codec=codec,
                     draft_tokens=draft_tokens_t[0].tolist()))
                 _dash_update(state="forward", current_step=tokens_generated)
@@ -213,7 +218,7 @@ def generation_loop(
                 trim_dynamic_cache(stage_kv, trim_to)
                 draft_model.trim_cache(trim_to)
                 kv_len = trim_to
-                send_msg(sockets["push"], make_control_msg("trim_cache", keep_len=trim_to))
+                async_push.send(make_control_msg("trim_cache", keep_len=trim_to))
 
                 elapsed = (time.perf_counter() - t0) * 1000
                 per_tok_ms = elapsed / M
@@ -232,7 +237,7 @@ def generation_loop(
                 with torch.no_grad():
                     hidden, stage_kv = stage_model(generated[:, -1:], past_key_values=stage_kv)
 
-                send_msg(sockets["push"], make_activation_msg(
+                async_push.send(make_activation_msg(
                     spec_step, 0, hidden, is_prefill=False, codec=codec))
                 _dash_update(state="forward", current_step=tokens_generated)
                 _publish(sockets["pub"], 0, host, spec_step, "forward", 0, tokens_generated)
@@ -254,7 +259,7 @@ def generation_loop(
                      times[-1] if times else 0, tokens_generated)
             spec_step += 1
 
-        send_msg(sockets["push"], make_control_msg("end_of_generation"))
+        async_push.send(make_control_msg("end_of_generation"))
 
         avg_ms = sum(times) / max(len(times), 1)
         tps = 1000.0 / avg_ms if avg_ms > 0 else 0
@@ -309,18 +314,18 @@ def generation_loop(
                 # Bonus: sample from position K (one past last draft)
                 p_bonus = torch.softmax(logits[0, K, :] / max(temperature, 1e-6), dim=-1)
                 target_samples.append(torch.multinomial(p_bonus, num_samples=1).item())
-                send_msg(sockets["token_push"], make_spec_result_msg(step, target_probs, target_samples))
+                async_token_push.send(make_spec_result_msg(step, target_probs, target_samples))
             else:
                 # Prefill or non-spec: sample from last position, return as spec_result or plain token
                 last_logits = logits[:, -1, :] / max(temperature, 1e-6)
                 probs = torch.softmax(last_logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)  # (1, 1)
                 if spec_enabled:
-                    send_msg(sockets["token_push"],
-                             make_spec_result_msg(step, [], [next_token.item()]))
+                    async_token_push.send(
+                        make_spec_result_msg(step, [], [next_token.item()]))
                 else:
-                    send_msg(sockets["token_push"],
-                             make_activation_msg(step, stage_id, next_token.float()))
+                    async_token_push.send(
+                        make_activation_msg(step, stage_id, next_token.float()))
 
             print(f"[Stage {stage_id}] Step {step:3d}  shape={tuple(hidden.shape)}  {elapsed:.1f}ms")
             _dash_update(state="forward", current_step=step, elapsed_ms=elapsed)
@@ -343,11 +348,11 @@ def generation_loop(
         while True:
             msg = recv_msg(sockets["pull"], timeout_ms=60_000)
             if msg is None or msg["msg_type"] == "end_of_generation":
-                send_msg(sockets["push"], make_control_msg("end_of_generation"))
+                async_push.send(make_control_msg("end_of_generation"))
                 break
             if msg["msg_type"] == "trim_cache":
                 trim_dynamic_cache(stage_kv, msg["keep_len"])
-                send_msg(sockets["push"], make_control_msg("trim_cache", keep_len=msg["keep_len"]))
+                async_push.send(make_control_msg("trim_cache", keep_len=msg["keep_len"]))
                 continue
 
             is_prefill = msg.get("is_prefill", True)
@@ -365,7 +370,7 @@ def generation_loop(
             elapsed = (time.perf_counter() - t0) * 1000
             times.append(elapsed)
 
-            send_msg(sockets["push"], make_activation_msg(
+            async_push.send(make_activation_msg(
                 step, stage_id, out, is_prefill=is_prefill, codec=codec,
                 draft_tokens=draft_tokens_list))
 

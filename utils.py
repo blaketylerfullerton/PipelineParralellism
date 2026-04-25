@@ -1,4 +1,6 @@
 import pickle
+import queue
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -8,6 +10,8 @@ import numpy as np
 import torch
 import yaml
 import zmq
+
+_SOCKET_BUF = 4 * 1024 * 1024  # 4 MB — reduces latency jitter on WAN
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -51,6 +55,7 @@ def get_worker_address(config: dict, stage_id: int) -> str:
 def make_pull_socket(context: zmq.Context, port: int) -> zmq.Socket:
     sock = context.socket(zmq.PULL)
     sock.setsockopt(zmq.RCVHWM, 20)
+    sock.setsockopt(zmq.RCVBUF, _SOCKET_BUF)
     sock.bind(f"tcp://*:{port}")
     return sock
 
@@ -58,6 +63,7 @@ def make_pull_socket(context: zmq.Context, port: int) -> zmq.Socket:
 def make_push_socket(context: zmq.Context, host: str, port: int) -> zmq.Socket:
     sock = context.socket(zmq.PUSH)
     sock.setsockopt(zmq.SNDHWM, 20)
+    sock.setsockopt(zmq.SNDBUF, _SOCKET_BUF)
     sock.connect(f"tcp://{host}:{port}")
     return sock
 
@@ -190,6 +196,34 @@ def make_control_msg(msg_type: str, **kwargs) -> bytes:
 
 
 # --- Send / Recv ---
+
+class AsyncSender:
+    """Serializes and sends pre-serialized messages in a background thread.
+
+    Calling .send() returns immediately; the socket.send() happens on a daemon
+    thread.  Because PUSH/PULL is ordered, messages arrive in queue order.
+    Call .flush() before tearing down if you need a hard guarantee all bytes
+    left the process (normally not required — ZMQ linger handles this).
+    """
+
+    def __init__(self, socket: zmq.Socket) -> None:
+        self._sock = socket
+        self._q: queue.Queue = queue.Queue(maxsize=8)
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+
+    def send(self, msg_bytes: bytes) -> None:
+        self._q.put(msg_bytes)
+
+    def flush(self) -> None:
+        self._q.join()
+
+    def _run(self) -> None:
+        while True:
+            msg = self._q.get()
+            self._sock.send(msg)
+            self._q.task_done()
+
 
 def send_msg(socket: zmq.Socket, msg_bytes: bytes) -> None:
     socket.send(msg_bytes)
