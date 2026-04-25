@@ -71,22 +71,11 @@ Per-token latency = 2 × compute + 2 × (network RTT + serialization). Every hop
 ![After Adding Compression](images/after_compression.png)
 
 
-### 1.2.5 Model architecture note — switching to Llama/Mistral 7B+
+### ~~1.2.5 Model architecture note — switching to Llama/Mistral 7B+~~ ✅ DONE
 
-When we move to a real model, the pipeline infrastructure (`worker.py`, `utils.py`, `launch.py`, codec, KV cache, sockets) needs **zero changes** — it's already model-agnostic. The only file that needs work is `model.py`.
+~~When we move to a real model, the pipeline infrastructure (`worker.py`, `utils.py`, `launch.py`, codec, KV cache, sockets) needs **zero changes** — it's already model-agnostic. The only file that needs work is `model.py`.~~
 
-**What's GPT-2 specific today:**
-- `Stage0Module` references `transformer.wte`, `transformer.wpe`, `transformer.drop` and manually adds positional embeddings in `forward` — Llama has no `wpe`, RoPE is computed inside each attention layer
-- `MiddleModule` / `LastModule` reference `transformer.h`, `transformer.ln_f`
-- `get_stage` / `get_tokenizer` hardcode `GPT2LMHeadModel` / `GPT2Tokenizer`
-
-**Plan when the time comes:**
-- Add `get_stage_llama(stage_id, num_stages, config)` alongside the existing `get_stage()` — new stage classes that reference `model.model.embed_tokens`, `model.model.layers`, `model.model.norm`
-- `Stage0Module.forward` simplifies to `hidden = embed_tokens(input_ids)` — no positional addition
-- Switch `get_stage` / `get_tokenizer` to `AutoModelForCausalLM` / `AutoTokenizer`, select stage builder via `config.model.arch` (`gpt2` vs `llama`)
-- Memory: 7B fp16 = ~14GB total → ~7GB per machine with 2 stages, fits in 16GB RAM
-
-Do this when Phase 2 (speculative decoding) is proven out, before Phase 3 (MoE). The draft model in `draft.py` will also need a Llama-compatible version at that point.
+**What we did:** Added `Stage0Llama`, `MiddleLlama`, `LastLlama` stage classes to `model.py`. `_run_llama_layers` replicates the `LlamaModel.forward` per-layer loop for a stage subset, computing RoPE position embeddings and causal masks locally. `_relabel_layer_idx` resets each sliced layer's `self_attn.layer_idx` to its local position so per-stage `DynamicCache` stays dense. `get_stage` / `get_tokenizer` now dispatch on `config.model.arch` (`gpt2` vs `llama`) using `AutoModelForCausalLM` / `AutoTokenizer`. `_resolve_dtype` maps config strings (`fp32`/`fp16`/`bf16`) to `torch.dtype`. After slicing the stage, the full model is deleted and `gc.collect()` is called to free the unused weight slice. `config.yaml` now points at `unsloth/Llama-3.2-3B` (target) and `unsloth/Llama-3.2-1B` (draft) with `dtype: bfloat16`.
 
 ### 1.3 Overlap send with compute
 

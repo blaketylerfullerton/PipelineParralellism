@@ -8,7 +8,7 @@ import torch
 import zmq
 
 from dashboard import get_dashboard, init_dashboard
-from model import get_stage, get_tokenizer
+from model import get_stage, get_tokenizer, resolve_dtype
 from utils import (
     get_forward_port,
     get_telemetry_port,
@@ -112,7 +112,8 @@ def generation_loop(
         draft_model = None
         if spec_enabled:
             from draft import DraftModel
-            draft_model = DraftModel(spec_cfg.get("draft_model", "gpt2"), temperature=temperature)
+            draft_model = DraftModel(spec_cfg.get("draft_model", "gpt2"), temperature=temperature,
+                                     torch_dtype=resolve_dtype(config))
 
         print(f"\n[Stage 0] Prompt ({input_ids.shape[1]} tokens): \"{prompt}\"")
         print("[Stage 0] Generating: ", end="", flush=True)
