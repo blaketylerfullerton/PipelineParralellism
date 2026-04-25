@@ -77,13 +77,17 @@ Per-token latency = 2 × compute + 2 × (network RTT + serialization). Every hop
 
 **What we did:** Added `Stage0Llama`, `MiddleLlama`, `LastLlama` stage classes to `model.py`. `_run_llama_layers` replicates the `LlamaModel.forward` per-layer loop for a stage subset, computing RoPE position embeddings and causal masks locally. `_relabel_layer_idx` resets each sliced layer's `self_attn.layer_idx` to its local position so per-stage `DynamicCache` stays dense. `get_stage` / `get_tokenizer` now dispatch on `config.model.arch` (`gpt2` vs `llama`) using `AutoModelForCausalLM` / `AutoTokenizer`. `_resolve_dtype` maps config strings (`fp32`/`fp16`/`bf16`) to `torch.dtype`. After slicing the stage, the full model is deleted and `gc.collect()` is called to free the unused weight slice. `config.yaml` now points at `unsloth/Llama-3.2-3B` (target) and `unsloth/Llama-3.2-1B` (draft) with `dtype: bfloat16`.
 
-### 1.3 Overlap send with compute
+### ~~1.3 Overlap send with compute~~ ✅ DONE
 
-Stage 0 currently sends hidden state, then blocks waiting for the returned token before starting the next forward. Stage 1 is idle while Stage 0 computes and vice versa — classic pipeline bubble.
+~~Stage 0 currently sends hidden state, then blocks waiting for the returned token before starting the next forward. Stage 1 is idle while Stage 0 computes and vice versa — classic pipeline bubble.~~
 
-- Use ZMQ in non-blocking mode (`zmq.DONTWAIT`) and drive sockets with a background thread.
-- While Stage 0 waits on `token_pull`, let it start *speculative* work on the next step (see Phase 2).
-- Better: switch to `asyncio` + `zmq.asyncio` so the generation loop is a coroutine that can overlap I/O with compute.
+~~- Use ZMQ in non-blocking mode (`zmq.DONTWAIT`) and drive sockets with a background thread.~~
+~~- While Stage 0 waits on `token_pull`, let it start *speculative* work on the next step (see Phase 2).~~
+~~- Better: switch to `asyncio` + `zmq.asyncio` so the generation loop is a coroutine that can overlap I/O with compute.~~
+
+**What we did:** Raised `ZMQ_SNDBUF`/`ZMQ_RCVBUF` to 4 MB on all push/pull sockets in `utils.py` — reduces latency jitter on WAN links and increases throughput headroom for larger hidden dims.
+
+Note: a background-thread `AsyncSender` approach was attempted to overlap serialization with compute, but ZMQ sockets are not thread-safe — using a socket from any thread other than the one that created it causes severe performance degradation (5x TPS regression observed). The correct approach for true async sends is `asyncio` + `zmq.asyncio`, deferred to Phase 3 where it's needed for MoE scatter-gather routing anyway.
 
 ### 1.4 Network-layer tuning
 
@@ -191,7 +195,7 @@ Tradeoff: you lose the educational from-scratch aspect of this repo, but you gai
 | Baseline (current code) | — | 1x | ~0.3 TPS |
 | ~~1.1 KV cache~~ ✅ | 2–3 days | 1.7× measured (192→112 ms/tok) | ~1 TPS |
 | ~~1.2 int8 activations~~ ✅ | 1 day | 1.3x | ~1.3 TPS |
-| 1.3 Async overlap | 2 days | 1.3x | ~1.7 TPS |
+| ~~1.3 Async overlap~~ ✅ | 2 days | 1.3x | ~1.7 TPS |
 | ~~2. Speculative decoding~~ ✅ | 1–2 weeks | measured with same-model test | ~5 TPS |
 | 3. MoE architecture | 2–4 weeks | 1.5–2x | ~8 TPS |
 | 4.2 Cascade (optional) | 3 days | 1.5x | ~12 TPS |

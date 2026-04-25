@@ -9,6 +9,8 @@ import torch
 import yaml
 import zmq
 
+_SOCKET_BUF = 4 * 1024 * 1024  # 4 MB — reduces latency jitter on WAN
+
 
 def load_config(path: str = "config.yaml") -> dict:
     with open(path) as f:
@@ -51,6 +53,7 @@ def get_worker_address(config: dict, stage_id: int) -> str:
 def make_pull_socket(context: zmq.Context, port: int) -> zmq.Socket:
     sock = context.socket(zmq.PULL)
     sock.setsockopt(zmq.RCVHWM, 20)
+    sock.setsockopt(zmq.RCVBUF, _SOCKET_BUF)
     sock.bind(f"tcp://*:{port}")
     return sock
 
@@ -58,6 +61,7 @@ def make_pull_socket(context: zmq.Context, port: int) -> zmq.Socket:
 def make_push_socket(context: zmq.Context, host: str, port: int) -> zmq.Socket:
     sock = context.socket(zmq.PUSH)
     sock.setsockopt(zmq.SNDHWM, 20)
+    sock.setsockopt(zmq.SNDBUF, _SOCKET_BUF)
     sock.connect(f"tcp://{host}:{port}")
     return sock
 
