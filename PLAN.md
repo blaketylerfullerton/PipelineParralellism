@@ -156,11 +156,13 @@ One machine does prefill (compute-bound, latency-insensitive), another does deco
 
 Implement as a new mode in `launch.py` — `--role prefill` vs `--role decode` — with KV cache serialization in `utils.py`.
 
-### 4.2 Cascade / early exit
+### ~~4.2 Cascade / early exit~~ ✅ DONE
 
-A local small model handles each token first. If entropy is low (confident), keep the local token. If high, fall back to the distributed big model.
+~~A local small model handles each token first. If entropy is low (confident), keep the local token. If high, fall back to the distributed big model.~~
 
-- Tunable threshold in `config.yaml`.
+**What we did:** After drafting 1 token, Stage 0 checks its top-1 probability. If `p0 >= cascade.confidence_threshold` (default 0.9), the token is accepted locally: Stage 0 runs its layers on `last_tok` only, fires the hidden to downstream stages as `is_cascade=True` (fire-and-forget, no recv), and moves on. Downstream stages handle `is_cascade` by updating their KV and not sending a response. On a cascade miss, Stage 0 drafts k-1 more tokens and falls through to the existing speculative decode path unchanged. End-of-generation summary prints `Cascade: X/Y steps handled locally (Z%)`. Threshold is tunable in `config.yaml`.
+
+- Tunable threshold in `config.yaml` (`cascade.confidence_threshold`).
 - Typically 60–80% of tokens handled locally at <5% quality hit.
 - Stacks with speculative decoding: local cascade handles easy tokens, speculative handles medium, full pipeline only for hard tokens.
 
@@ -199,7 +201,7 @@ Tradeoff: you lose the educational from-scratch aspect of this repo, but you gai
 | ~~2. Speculative decoding~~ ✅ | 1–2 weeks | measured with same-model test | ~5 TPS |
 | 2.5 Speculative pipelining | 1 day | 1.06–1.10x | ~5.5 TPS |
 | 3. MoE architecture | 2–4 weeks | 1.5–2x | ~8 TPS |
-| 4.2 Cascade (optional) | 3 days | 1.5x | ~12 TPS |
+| ~~4.2 Cascade~~ ✅ | 3 days | 1.5x | ~12 TPS |
 
 Phase 1 is pure refactor of the existing code — do it before anything else, in order. Phase 2 is the highest leverage new feature. Phase 3 is a real rewrite; only do it after Phase 2 proves the rest of the stack works.
 

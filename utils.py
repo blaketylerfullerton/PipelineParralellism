@@ -143,6 +143,7 @@ def make_activation_msg(
     is_prefill: bool = False,
     codec: str = "fp32",
     draft_tokens: Optional[List[int]] = None,
+    is_cascade: bool = False,
 ) -> bytes:
     encoded = encode_activation(tensor, codec)
     msg = {
@@ -151,6 +152,7 @@ def make_activation_msg(
         "stage_id": stage_id,
         "is_prefill": is_prefill,
         "draft_tokens": draft_tokens,  # list of K ints (spec mode) or None
+        "is_cascade": is_cascade,      # True → update KV only, no response
         "timestamp_sent": time.time(),
         **encoded,
     }
