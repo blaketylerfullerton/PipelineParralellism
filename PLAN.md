@@ -197,6 +197,7 @@ Tradeoff: you lose the educational from-scratch aspect of this repo, but you gai
 | ~~1.2 int8 activations~~ ✅ | 1 day | 1.3x | ~1.3 TPS |
 | ~~1.3 Async overlap~~ ✅ | 2 days | 1.3x | ~1.7 TPS |
 | ~~2. Speculative decoding~~ ✅ | 1–2 weeks | measured with same-model test | ~5 TPS |
+| 2.5 Speculative pipelining | 1 day | 1.06–1.10x | ~5.5 TPS |
 | 3. MoE architecture | 2–4 weeks | 1.5–2x | ~8 TPS |
 | 4.2 Cascade (optional) | 3 days | 1.5x | ~12 TPS |
 
@@ -217,6 +218,7 @@ Phase 1 is pure refactor of the existing code — do it before anything else, in
 
 - **Phase 1.2**: *SmoothQuant* (Xiao et al. 2023), *ZeroQuant* — activation quantization math.
 - **Phase 2**: Leviathan et al. 2023 (*Fast Inference from Transformers via Speculative Decoding*), *EAGLE-2*, *Medusa*.
+- **Phase 2.5**: See `SPECULATIVE_PIPELINE.md` for full design — threading model, seed problem, hit rate expectations, and tree speculation upgrade path.
 - **Phase 3**: *Switch Transformer* (Fedus et al.), *Mixtral of Experts*, *Petals* (Borzunov et al. 2023 — closest prior art for your exact problem).
 - **Phase 4.1**: *DistServe*, *Splitwise* — prefill/decode disaggregation.
 - **Phase 4.3**: *PipeDream* (Narayanan et al.), *GPipe* (Huang et al.).
