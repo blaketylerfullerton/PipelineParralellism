@@ -267,7 +267,7 @@ def _get_stage_llama(stage_id: int, num_stages: int, config: dict) -> nn.Module:
     model_name = config["model"]["name"]
     dtype = resolve_dtype(config)
     print(f"  Loading {model_name} ({dtype}) — stage {stage_id}/{num_stages - 1}...")
-    full = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype)
+    full = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype)
     full.eval()
 
     num_layers = len(full.model.layers)

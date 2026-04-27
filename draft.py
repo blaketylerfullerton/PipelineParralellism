@@ -11,7 +11,7 @@ class DraftModel:
     def __init__(self, model_name: str, temperature: float = 1.0, torch_dtype: torch.dtype = torch.float32):
         self._device = get_device()
         print(f"  [Draft] Loading {model_name} on {self._device}...")
-        self.model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch_dtype)
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch_dtype)
         self.model = self.model.to(self._device)
         self.model.eval()
         self.temperature = temperature
@@ -25,6 +25,24 @@ class DraftModel:
         with torch.no_grad():
             out = self.model(input_ids.to(self._device), use_cache=True)
         self._kv = out.past_key_values
+
+    def draft_peek(self, seed_token: torch.Tensor):
+        """
+        Run one draft step and return (token (1,1) CPU, sampled_prob, max_prob).
+        Advances self._kv by one position (seed_token processed).
+        max_prob is the peak of the distribution — use this for cascade decisions,
+        not sampled_prob, which is the probability of whichever token was sampled.
+        """
+        current = seed_token.to(self._device)
+        with torch.no_grad():
+            out = self.model(current, past_key_values=self._kv, use_cache=True)
+        self._kv = out.past_key_values
+        logits = out.logits[:, -1, :] / max(self.temperature, 1e-6)
+        p = torch.softmax(logits, dim=-1)
+        next_tok = torch.multinomial(p, num_samples=1)
+        sampled_prob = p[0, next_tok[0, 0]].item()
+        max_prob = p.max().item()
+        return next_tok.cpu(), sampled_prob, max_prob
 
     def draft_k_tokens(self, seed_token: torch.Tensor, k: int):
         """

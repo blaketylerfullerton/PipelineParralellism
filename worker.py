@@ -170,11 +170,13 @@ def generation_loop(
                 last_tok = generated[:, -1:]  # (1,1) — not yet in KV cache
                 kv_before = kv_len
 
-                # Draft 1 token first to check confidence for cascade
-                d0_tokens, d0_probs = draft_model.draft_k_tokens(last_tok, 1)
-                p0 = d0_probs[0].item()
+                # Peek at first draft token — use max_prob (distribution peak) for
+                # cascade decision, not sampled_prob (which can be low even when
+                # the model is very confident about one token)
+                d0_tokens, d0_prob_sampled, d0_prob_max = draft_model.draft_peek(last_tok)
+                d0_probs = torch.tensor([d0_prob_sampled])
 
-                if cascade_enabled and p0 >= cascade_threshold:
+                if cascade_enabled and d0_prob_max >= cascade_threshold:
                     # ---- Cascade: accept locally, buffer hidden for later batch send ----
                     with torch.no_grad():
                         hidden, stage_kv = stage_model(last_tok, past_key_values=stage_kv)
