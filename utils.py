@@ -12,6 +12,15 @@ import zmq
 _SOCKET_BUF = 4 * 1024 * 1024  # 4 MB — reduces latency jitter on WAN
 
 
+def get_device() -> str:
+    """Return the best available compute device: mps > cuda > cpu."""
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
 def load_config(path: str = "config.yaml") -> dict:
     with open(path) as f:
         cfg = yaml.safe_load(f)

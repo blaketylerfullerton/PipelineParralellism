@@ -6,6 +6,8 @@ from transformers.cache_utils import DynamicCache
 from transformers.masking_utils import create_causal_mask
 from typing import List, Optional, Tuple
 
+from utils import get_device
+
 
 # ===================================================================== GPT-2
 
@@ -140,19 +142,20 @@ class Stage0Llama(nn.Module):
     ) -> Tuple[torch.Tensor, DynamicCache]:
         if past_key_values is None:
             past_key_values = DynamicCache()
+        input_ids = input_ids.to(self.embed_tokens.weight.device)
         hidden = self.embed_tokens(input_ids)
         hidden = _run_llama_layers(self.layers, self.rotary_emb, self.config, hidden, past_key_values)
-        return hidden, past_key_values
+        return hidden.cpu(), past_key_values
 
 
 def _match_weight_dtype(module: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
-    """Hidden states arrive over the wire as fp32 (codec-decoded); cast to match
-    the stage's weight dtype so matmuls don't error on bf16/fp16 models."""
+    """Move hidden states to match the stage's device and dtype.
+    Hidden arrives over the wire as CPU fp32; this handles both casts in one call."""
     try:
-        wd = next(module.parameters()).dtype
+        param = next(module.parameters())
     except StopIteration:
         return hidden
-    return hidden.to(wd) if hidden.dtype != wd else hidden
+    return hidden.to(device=param.device, dtype=param.dtype)
 
 
 class MiddleLlama(nn.Module):
@@ -175,7 +178,7 @@ class MiddleLlama(nn.Module):
             past_key_values = DynamicCache()
         hidden = _match_weight_dtype(self, hidden)
         hidden = _run_llama_layers(self.layers, self.rotary_emb, self.config, hidden, past_key_values)
-        return hidden, past_key_values
+        return hidden.cpu(), past_key_values
 
 
 class LastLlama(nn.Module):
@@ -203,7 +206,7 @@ class LastLlama(nn.Module):
             past_key_values = DynamicCache()
         hidden = _match_weight_dtype(self, hidden)
         hidden = _run_llama_layers(self.layers, self.rotary_emb, self.config, hidden, past_key_values)
-        return self.lm_head(self.norm(hidden)), past_key_values
+        return self.lm_head(self.norm(hidden)).cpu(), past_key_values
 
 
 # =================================================================== Helpers
@@ -278,8 +281,12 @@ def _get_stage_llama(stage_id: int, num_stages: int, config: dict) -> nn.Module:
     else:
         stage = MiddleLlama(full, s, e)
 
+    device = get_device()
+    print(f"  Moving stage {stage_id} to {device}...")
+    stage = stage.to(device)
+
     # Release the unused slice of the full model. Tied lm_head / embed_tokens
-    # Parameters still referenced by the stage stay alive via reference counting.
+    # parameters still referenced by the stage stay alive via reference counting.
     del full
     gc.collect()
     return stage
