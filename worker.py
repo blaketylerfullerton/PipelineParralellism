@@ -131,6 +131,7 @@ def generation_loop(
         accepted_total = 0
         spec_steps_total = 0
         cascade_hits = 0
+        cascade_hidden_buf: list = []  # accumulated Stage-0 hiddens not yet sent to Stage N
 
         while tokens_generated < max_new_tokens:
             is_prefill = (spec_step == 0)
@@ -174,11 +175,10 @@ def generation_loop(
                 p0 = d0_probs[0].item()
 
                 if cascade_enabled and p0 >= cascade_threshold:
-                    # ---- Cascade: accept locally, fire hidden to Stage N, no recv ----
+                    # ---- Cascade: accept locally, buffer hidden for later batch send ----
                     with torch.no_grad():
                         hidden, stage_kv = stage_model(last_tok, past_key_values=stage_kv)
-                    send_msg(sockets["push"], make_activation_msg(
-                        spec_step, 0, hidden, is_prefill=False, codec=codec, is_cascade=True))
+                    cascade_hidden_buf.append(hidden)  # (1, 1, D) — flushed at next spec step
 
                     accepted_tok_id = d0_tokens[0, 0].item()
                     generated = torch.cat([generated, d0_tokens[:, :1]], dim=1)
@@ -203,9 +203,16 @@ def generation_loop(
                     with torch.no_grad():
                         hidden, stage_kv = stage_model(feed, past_key_values=stage_kv)
 
+                    # Prepend any buffered cascade hiddens so Stage N catches up in one batch
+                    cascade_prefix_len = len(cascade_hidden_buf)
+                    if cascade_hidden_buf:
+                        hidden = torch.cat(cascade_hidden_buf + [hidden], dim=1)
+                        cascade_hidden_buf.clear()
+
                     send_msg(sockets["push"], make_activation_msg(
                         spec_step, 0, hidden, is_prefill=False, codec=codec,
-                        draft_tokens=draft_tokens_t[0].tolist()))
+                        draft_tokens=draft_tokens_t[0].tolist(),
+                        cascade_prefix_len=cascade_prefix_len))
                     _dash_update(state="forward", current_step=tokens_generated)
                     _publish(sockets["pub"], 0, host, spec_step, "forward", 0, tokens_generated)
 
@@ -318,19 +325,12 @@ def generation_loop(
                 trim_dynamic_cache(stage_kv, msg["keep_len"])
                 continue
 
-            if msg.get("is_cascade", False):
-                # Cascade token: update KV only, no response needed
-                hidden = tensor_from_activation_msg(msg)
-                with torch.no_grad():
-                    _, stage_kv = stage_model(hidden, past_key_values=stage_kv)
-                step += 1
-                continue
-
             if msg.get("is_prefill", True):
                 stage_kv = None
 
             hidden = tensor_from_activation_msg(msg)
             draft_tokens_list = msg.get("draft_tokens")  # list of K ints or None
+            N = msg.get("cascade_prefix_len", 0)        # cascade hiddens prepended to hidden
             _dash_update(state="forward", current_step=step)
             _publish(sockets["pub"], stage_id, host, step, "forward", 0, step)
 
@@ -343,15 +343,15 @@ def generation_loop(
             is_spec_step = spec_enabled and not msg.get("is_prefill", True) and draft_tokens_list is not None
 
             if is_spec_step:
-                # Return p(draft_i) for each position + one sample per position
+                # Logits for spec tokens start at position N (after cascade prefix)
                 K = len(draft_tokens_list)
                 target_probs, target_samples = [], []
                 for i in range(K):
-                    p_i = torch.softmax(logits[0, i, :] / max(temperature, 1e-6), dim=-1)
+                    p_i = torch.softmax(logits[0, N + i, :] / max(temperature, 1e-6), dim=-1)
                     target_probs.append(p_i[draft_tokens_list[i]].item())
                     target_samples.append(torch.multinomial(p_i, num_samples=1).item())
-                # Bonus: sample from position K (one past last draft)
-                p_bonus = torch.softmax(logits[0, K, :] / max(temperature, 1e-6), dim=-1)
+                # Bonus: sample from position N+K (one past last draft)
+                p_bonus = torch.softmax(logits[0, N + K, :] / max(temperature, 1e-6), dim=-1)
                 target_samples.append(torch.multinomial(p_bonus, num_samples=1).item())
                 send_msg(sockets["token_push"], make_spec_result_msg(step, target_probs, target_samples))
             else:
@@ -394,18 +394,9 @@ def generation_loop(
                 send_msg(sockets["push"], make_control_msg("trim_cache", keep_len=msg["keep_len"]))
                 continue
 
-            if msg.get("is_cascade", False):
-                # Cascade token: update KV and forward hidden, no response to Stage 0
-                hidden = tensor_from_activation_msg(msg)
-                with torch.no_grad():
-                    out, stage_kv = stage_model(hidden, past_key_values=stage_kv)
-                send_msg(sockets["push"], make_activation_msg(
-                    step, stage_id, out, is_cascade=True, codec=codec))
-                step += 1
-                continue
-
             is_prefill = msg.get("is_prefill", True)
             draft_tokens_list = msg.get("draft_tokens")
+            cascade_prefix_len = msg.get("cascade_prefix_len", 0)
             if is_prefill:
                 stage_kv = None
 
@@ -421,7 +412,7 @@ def generation_loop(
 
             send_msg(sockets["push"], make_activation_msg(
                 step, stage_id, out, is_prefill=is_prefill, codec=codec,
-                draft_tokens=draft_tokens_list))
+                draft_tokens=draft_tokens_list, cascade_prefix_len=cascade_prefix_len))
 
             print(f"[Stage {stage_id}] Step {step:3d}  shape={tuple(hidden.shape)} → {tuple(out.shape)}  {elapsed:.1f}ms")
             _dash_update(state="forward", current_step=step, elapsed_ms=elapsed)
