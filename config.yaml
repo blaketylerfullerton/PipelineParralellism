@@ -23,5 +23,9 @@ speculative:
   k: 6
   draft_model: "unsloth/Llama-3.2-1B"
 
+cascade:
+  enabled: true
+  confidence_threshold: 0.9   # top-1 draft probability above which token is accepted locally
+
 dashboard:
   refresh_rate_hz: 10

@@ -119,6 +119,10 @@ def generation_loop(
         print("[Stage 0] Generating: ", end="", flush=True)
         _dash_update(state="running", current_step=0)
 
+        cascade_cfg = config.get("cascade", {})
+        cascade_enabled = cascade_cfg.get("enabled", False) and spec_enabled
+        cascade_threshold = float(cascade_cfg.get("confidence_threshold", 0.9))
+
         times = []
         stage_kv = None
         kv_len = 0
@@ -126,6 +130,7 @@ def generation_loop(
         spec_step = 0
         accepted_total = 0
         spec_steps_total = 0
+        cascade_hits = 0
 
         while tokens_generated < max_new_tokens:
             is_prefill = (spec_step == 0)
@@ -160,72 +165,99 @@ def generation_loop(
                 tokens_generated += 1
 
             elif spec_enabled:
-                # ---- Speculative decode ----
+                # ---- Speculative decode (with optional cascade fast-path) ----
                 last_tok = generated[:, -1:]  # (1,1) — not yet in KV cache
                 kv_before = kv_len
 
-                draft_tokens_t, draft_probs_t = draft_model.draft_k_tokens(last_tok, k)
-                # draft_tokens_t: (1, k), draft_probs_t: (k,)
+                # Draft 1 token first to check confidence for cascade
+                d0_tokens, d0_probs = draft_model.draft_k_tokens(last_tok, 1)
+                p0 = d0_probs[0].item()
 
-                feed = torch.cat([last_tok, draft_tokens_t], dim=1)  # (1, k+1)
-                with torch.no_grad():
-                    hidden, stage_kv = stage_model(feed, past_key_values=stage_kv)
+                if cascade_enabled and p0 >= cascade_threshold:
+                    # ---- Cascade: accept locally, fire hidden to Stage N, no recv ----
+                    with torch.no_grad():
+                        hidden, stage_kv = stage_model(last_tok, past_key_values=stage_kv)
+                    send_msg(sockets["push"], make_activation_msg(
+                        spec_step, 0, hidden, is_prefill=False, codec=codec, is_cascade=True))
 
-                send_msg(sockets["push"], make_activation_msg(
-                    spec_step, 0, hidden, is_prefill=False, codec=codec,
-                    draft_tokens=draft_tokens_t[0].tolist()))
-                _dash_update(state="forward", current_step=tokens_generated)
-                _publish(sockets["pub"], 0, host, spec_step, "forward", 0, tokens_generated)
+                    accepted_tok_id = d0_tokens[0, 0].item()
+                    generated = torch.cat([generated, d0_tokens[:, :1]], dim=1)
+                    elapsed = (time.perf_counter() - t0) * 1000
+                    times.append(elapsed)
+                    print(tokenizer.decode([accepted_tok_id]), end="", flush=True)
+                    tokens_generated += 1
+                    kv_len = kv_before + 1
+                    cascade_hits += 1
 
-                msg = None
-                while msg is None:
-                    msg = recv_msg(sockets["token_pull"], timeout_ms=60_000)
-
-                target_probs = msg["target_probs"]    # [k] floats
-                target_samples = msg["target_samples"]  # [k+1] ints
-
-                # Speculative accept/reject (Leviathan et al. 2023, Algorithm 1)
-                accepted = []
-                for i in range(k):
-                    p_i = target_probs[i]
-                    q_i = draft_probs_t[i].item()
-                    if random.random() <= min(1.0, p_i / (q_i + 1e-9)):
-                        accepted.append(draft_tokens_t[0, i].item())
-                    else:
-                        accepted.append(target_samples[i])  # resample from adjusted dist
-                        break
                 else:
-                    accepted.append(target_samples[k])  # bonus token when all k accepted
+                    # ---- Speculative decode: draft k-1 more, then verify with pipeline ----
+                    if k > 1:
+                        rest_tokens, rest_probs = draft_model.draft_k_tokens(d0_tokens[:, -1:], k - 1)
+                        draft_tokens_t = torch.cat([d0_tokens, rest_tokens], dim=1)  # (1, k)
+                        draft_probs_t = torch.cat([d0_probs, rest_probs])
+                    else:
+                        draft_tokens_t = d0_tokens
+                        draft_probs_t = d0_probs
 
-                # Clip to remaining budget
-                remaining = max_new_tokens - tokens_generated
-                accepted = accepted[:remaining]
-                M = len(accepted)
+                    feed = torch.cat([last_tok, draft_tokens_t], dim=1)  # (1, k+1)
+                    with torch.no_grad():
+                        hidden, stage_kv = stage_model(feed, past_key_values=stage_kv)
 
-                # When all K drafts are accepted, draft KV is at kv_before+k (processed
-                # seed_token..draft_{k-1}), but target KV is at kv_before+k+1 (also
-                # processed draft_k). Advance draft by one to stay in sync.
-                if M == k + 1:
-                    draft_model.advance_cache(draft_tokens_t[0, k - 1].item())
+                    send_msg(sockets["push"], make_activation_msg(
+                        spec_step, 0, hidden, is_prefill=False, codec=codec,
+                        draft_tokens=draft_tokens_t[0].tolist()))
+                    _dash_update(state="forward", current_step=tokens_generated)
+                    _publish(sockets["pub"], 0, host, spec_step, "forward", 0, tokens_generated)
 
-                # Trim all caches to consistent length
-                trim_to = kv_before + M
-                trim_dynamic_cache(stage_kv, trim_to)
-                draft_model.trim_cache(trim_to)
-                kv_len = trim_to
-                send_msg(sockets["push"], make_control_msg("trim_cache", keep_len=trim_to))
+                    msg = None
+                    while msg is None:
+                        msg = recv_msg(sockets["token_pull"], timeout_ms=60_000)
 
-                elapsed = (time.perf_counter() - t0) * 1000
-                per_tok_ms = elapsed / M
+                    target_probs = msg["target_probs"]    # [k] floats
+                    target_samples = msg["target_samples"]  # [k+1] ints
 
-                new_tokens_t = torch.tensor([accepted], dtype=torch.long)
-                generated = torch.cat([generated, new_tokens_t], dim=1)
-                for tok_id in accepted:
-                    print(tokenizer.decode([tok_id]), end="", flush=True)
-                    times.append(per_tok_ms)
-                tokens_generated += M
-                accepted_total += M
-                spec_steps_total += 1
+                    # Speculative accept/reject (Leviathan et al. 2023, Algorithm 1)
+                    accepted = []
+                    for i in range(k):
+                        p_i = target_probs[i]
+                        q_i = draft_probs_t[i].item()
+                        if random.random() <= min(1.0, p_i / (q_i + 1e-9)):
+                            accepted.append(draft_tokens_t[0, i].item())
+                        else:
+                            accepted.append(target_samples[i])  # resample from adjusted dist
+                            break
+                    else:
+                        accepted.append(target_samples[k])  # bonus token when all k accepted
+
+                    # Clip to remaining budget
+                    remaining = max_new_tokens - tokens_generated
+                    accepted = accepted[:remaining]
+                    M = len(accepted)
+
+                    # When all K drafts are accepted, draft KV is at kv_before+k (processed
+                    # seed_token..draft_{k-1}), but target KV is at kv_before+k+1 (also
+                    # processed draft_k). Advance draft by one to stay in sync.
+                    if M == k + 1:
+                        draft_model.advance_cache(draft_tokens_t[0, k - 1].item())
+
+                    # Trim all caches to consistent length
+                    trim_to = kv_before + M
+                    trim_dynamic_cache(stage_kv, trim_to)
+                    draft_model.trim_cache(trim_to)
+                    kv_len = trim_to
+                    send_msg(sockets["push"], make_control_msg("trim_cache", keep_len=trim_to))
+
+                    elapsed = (time.perf_counter() - t0) * 1000
+                    per_tok_ms = elapsed / M
+
+                    new_tokens_t = torch.tensor([accepted], dtype=torch.long)
+                    generated = torch.cat([generated, new_tokens_t], dim=1)
+                    for tok_id in accepted:
+                        print(tokenizer.decode([tok_id]), end="", flush=True)
+                        times.append(per_tok_ms)
+                    tokens_generated += M
+                    accepted_total += M
+                    spec_steps_total += 1
 
             else:
                 # ---- Non-speculative decode ----
@@ -261,8 +293,12 @@ def generation_loop(
         print(f"\n\n[Stage 0] Done. {tokens_generated} tokens, avg {avg_ms:.1f} ms/token ({tps:.2f} TPS)")
         if spec_enabled and spec_steps_total > 0:
             avg_acc = accepted_total / spec_steps_total
-            print(f"[Stage 0] Spec:  avg {avg_acc:.2f} tokens/step  "
+            print(f"[Stage 0] Spec:    avg {avg_acc:.2f} tokens/step  "
                   f"(k={k}, acceptance={avg_acc / (k + 1):.1%})")
+        if cascade_enabled:
+            total_steps = cascade_hits + spec_steps_total
+            pct = cascade_hits / max(total_steps, 1) * 100
+            print(f"[Stage 0] Cascade: {cascade_hits}/{total_steps} steps handled locally ({pct:.0f}%)")
         _dash_update(state="done", current_step=tokens_generated)
         _publish(sockets["pub"], 0, host, spec_step, "done", avg_ms, tokens_generated)
 
@@ -280,6 +316,14 @@ def generation_loop(
                 break
             if msg["msg_type"] == "trim_cache":
                 trim_dynamic_cache(stage_kv, msg["keep_len"])
+                continue
+
+            if msg.get("is_cascade", False):
+                # Cascade token: update KV only, no response needed
+                hidden = tensor_from_activation_msg(msg)
+                with torch.no_grad():
+                    _, stage_kv = stage_model(hidden, past_key_values=stage_kv)
+                step += 1
                 continue
 
             if msg.get("is_prefill", True):
@@ -348,6 +392,16 @@ def generation_loop(
             if msg["msg_type"] == "trim_cache":
                 trim_dynamic_cache(stage_kv, msg["keep_len"])
                 send_msg(sockets["push"], make_control_msg("trim_cache", keep_len=msg["keep_len"]))
+                continue
+
+            if msg.get("is_cascade", False):
+                # Cascade token: update KV and forward hidden, no response to Stage 0
+                hidden = tensor_from_activation_msg(msg)
+                with torch.no_grad():
+                    out, stage_kv = stage_model(hidden, past_key_values=stage_kv)
+                send_msg(sockets["push"], make_activation_msg(
+                    step, stage_id, out, is_cascade=True, codec=codec))
+                step += 1
                 continue
 
             is_prefill = msg.get("is_prefill", True)
