@@ -35,6 +35,7 @@ SIZE="${SIZE:-s-4vcpu-8gb}"
 
 export DIGITALOCEAN_ACCESS_TOKEN="$DO_TOKEN"
 IMAGE="ubuntu-24-04-x64"
+GIT_BRANCH=$(git -C "$(dirname "$0")/.." rev-parse --abbrev-ref HEAD)
 
 # ── WireGuard key generation ──────────────────────────────────────────────────
 echo "Generating WireGuard keypairs..."
@@ -80,8 +81,8 @@ echo "[init] Installing system packages..."
 apt-get update -qq
 apt-get install -y -qq python3 python3-pip python3-venv git curl wireguard wireguard-tools build-essential
 
-echo "[init] Cloning repo..."
-git clone "https://github.com/${GITHUB_REPO}.git" /opt/pipeline
+echo "[init] Cloning repo (branch: ${GIT_BRANCH})..."
+git clone --branch "${GIT_BRANCH}" "https://github.com/${GITHUB_REPO}.git" /opt/pipeline
 cd /opt/pipeline
 
 echo "[init] Installing Python deps (CPU torch)..."
