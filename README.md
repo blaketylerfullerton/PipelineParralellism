@@ -1,3 +1,6 @@
+![Networking](images/networking.png)
+
+
 # Relay
 
 > **Research project.** The goal is to decentralize AI compute — running large models cooperatively across ordinary consumer machines connected over the open internet, with no shared memory, no datacenter fabric, and no specialized hardware. This is an attempt to push the limits of what WAN inference can actually do.

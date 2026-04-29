@@ -17,13 +17,17 @@ Optional:
 
 import argparse
 import json
+import os
 import socket
 import subprocess
 import threading
 import time
 from typing import Dict, List, Optional
 
+import torch
 import zmq
+
+torch.set_num_threads(os.cpu_count() or 1)
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
@@ -310,7 +314,8 @@ def main() -> None:
         f"IP [cyan]{my_ip}[/]  |  "
         f"Host [cyan]{hostname}[/]  |  "
         f"Model [cyan]{config['model'].get('name', 'gpt2')}[/]  |  "
-        f"Stages [cyan]{num_stages}[/]"
+        f"Stages [cyan]{num_stages}[/]  |  "
+        f"Torch threads [cyan]{torch.get_num_threads()}[/] / {os.cpu_count()} cores"
     )
 
     # --- Discovery or manual IP phase ---

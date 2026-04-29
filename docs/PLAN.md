@@ -4,6 +4,15 @@ Goal: make pipeline parallelism across WAN-connected CPU machines (WireGuard, di
 
 Realistic target after the full stack: **3–8 TPS for a 70B-equivalent MoE model on 2–3 CPU machines across different internets.** Interactive-ish, not snappy. Good enough for agent workflows.
 
+**Current measured baseline (2× s-8vcpu-16gb DO droplets, same region, WireGuard, Llama 3.2-3B bf16):**
+- **1.10 TPS** end-to-end
+- Draft (Llama 1B, k=6): ~1200ms per round
+- Stage 0 forward: ~650ms per round
+- Stage 1 forward + wait: ~3200ms per round (network RTT negligible — same region)
+- Speculative acceptance rate: **77.1%** (excellent)
+- Cascade hit rate: **29%** (2/7 steps locally)
+- Bottleneck: **CPU memory bandwidth** on both machines. Network is not the constraint.
+
 ---
 
 ## Bottleneck analysis for current code
