@@ -1,4 +1,5 @@
 import argparse
+import os
 import pickle
 import random
 import time
@@ -6,6 +7,9 @@ from typing import Optional
 
 import torch
 import zmq
+
+# Ensure PyTorch uses all available cores — on Linux it can default to 1
+torch.set_num_threads(os.cpu_count() or 1)
 
 from dashboard import get_dashboard, init_dashboard
 from model import get_stage, get_tokenizer, resolve_dtype
@@ -173,19 +177,25 @@ def generation_loop(
                 # Peek at first draft token — use max_prob (distribution peak) for
                 # cascade decision, not sampled_prob (which can be low even when
                 # the model is very confident about one token)
+                t_draft_start = time.perf_counter()
                 d0_tokens, d0_prob_sampled, d0_prob_max = draft_model.draft_peek(last_tok)
                 d0_probs = torch.tensor([d0_prob_sampled])
 
                 if cascade_enabled and d0_prob_max >= cascade_threshold:
                     # ---- Cascade: accept locally, buffer hidden for later batch send ----
+                    t_fwd_start = time.perf_counter()
                     with torch.no_grad():
                         hidden, stage_kv = stage_model(last_tok, past_key_values=stage_kv)
+                    t_fwd_end = time.perf_counter()
                     cascade_hidden_buf.append(hidden)  # (1, 1, D) — flushed at next spec step
 
                     accepted_tok_id = d0_tokens[0, 0].item()
                     generated = torch.cat([generated, d0_tokens[:, :1]], dim=1)
                     elapsed = (time.perf_counter() - t0) * 1000
                     times.append(elapsed)
+                    draft_ms = (t_fwd_start - t_draft_start) * 1000
+                    fwd_ms = (t_fwd_end - t_fwd_start) * 1000
+                    print(f"\n[Step {spec_step:3d}] CASCADE  draft={draft_ms:.0f}ms  fwd={fwd_ms:.0f}ms  buf={len(cascade_hidden_buf)}  conf={d0_prob_max:.2f}", flush=True)
                     print(tokenizer.decode([accepted_tok_id]), end="", flush=True)
                     tokens_generated += 1
                     kv_len = kv_before + 1
@@ -201,9 +211,11 @@ def generation_loop(
                         draft_tokens_t = d0_tokens
                         draft_probs_t = d0_probs
 
+                    t_fwd_start = time.perf_counter()
                     feed = torch.cat([last_tok, draft_tokens_t], dim=1)  # (1, k+1)
                     with torch.no_grad():
                         hidden, stage_kv = stage_model(feed, past_key_values=stage_kv)
+                    t_fwd_end = time.perf_counter()
 
                     # Prepend any buffered cascade hiddens so Stage N catches up in one batch
                     cascade_prefix_len = len(cascade_hidden_buf)
@@ -211,6 +223,7 @@ def generation_loop(
                         hidden = torch.cat(cascade_hidden_buf + [hidden], dim=1)
                         cascade_hidden_buf.clear()
 
+                    t_send = time.perf_counter()
                     send_msg(sockets["push"], make_activation_msg(
                         spec_step, 0, hidden, is_prefill=False, codec=codec,
                         draft_tokens=draft_tokens_t[0].tolist(),
@@ -218,9 +231,11 @@ def generation_loop(
                     _dash_update(state="forward", current_step=tokens_generated)
                     _publish(sockets["pub"], 0, host, spec_step, "forward", 0, tokens_generated)
 
+                    t_wait_start = time.perf_counter()
                     msg = None
                     while msg is None:
                         msg = recv_msg(sockets["token_pull"], timeout_ms=60_000)
+                    t_wait_end = time.perf_counter()
 
                     target_probs = msg["target_probs"]    # [k] floats
                     target_samples = msg["target_samples"]  # [k+1] ints
@@ -258,6 +273,11 @@ def generation_loop(
 
                     elapsed = (time.perf_counter() - t0) * 1000
                     per_tok_ms = elapsed / M
+
+                    draft_ms = (t_fwd_start - t_draft_start) * 1000
+                    fwd_ms = (t_fwd_end - t_fwd_start) * 1000
+                    wait_ms = (t_wait_end - t_wait_start) * 1000
+                    print(f"\n[Step {spec_step:3d}] SPEC     draft={draft_ms:.0f}ms  fwd={fwd_ms:.0f}ms  wait={wait_ms:.0f}ms  acc={M}/{k}  {per_tok_ms:.0f}ms/tok", flush=True)
 
                     new_tokens_t = torch.tensor([accepted], dtype=torch.long)
                     generated = torch.cat([generated, new_tokens_t], dim=1)
@@ -436,6 +456,7 @@ def main() -> None:
 
     config["network"]["workers"][args.stage] = args.host
 
+    print(f"[Stage {args.stage}] CPU cores: {os.cpu_count()}  PyTorch threads: {torch.get_num_threads()}")
     print(f"[Stage {args.stage}] Loading model slice...")
     stage_model = get_stage(args.stage, num_stages, config)
     stage_model.eval()
