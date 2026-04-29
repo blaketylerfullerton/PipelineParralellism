@@ -1,8 +1,8 @@
-# PipeLineParallel
+# Relay
 
 > **Research project.** The goal is to decentralize AI compute — running large models cooperatively across ordinary consumer machines connected over the open internet, with no shared memory, no datacenter fabric, and no specialized hardware. This is an attempt to push the limits of what WAN inference can actually do.
 
-Most distributed ML research assumes you have a high-bandwidth, low-latency interconnect (NVLink, InfiniBand, a datacenter LAN). This project deliberately doesn't. The bet is that with the right combination of pipeline parallelism, speculative decoding, aggressive compression, and smarter local caching, you can make inference across geographically separate commodity machines practical — not just possible.
+Most distributed ML research assumes you have a high-bandwidth, low-latency interconnect (NVLink, InfiniBand, a datacenter LAN). Relay deliberately doesn't. The bet is that with the right combination of pipeline parallelism, speculative decoding, aggressive compression, and smarter local caching, you can make inference across geographically separate commodity machines practical — not just possible.
 
 DigitalOcean droplets over WireGuard stand in for the real target: two people's laptops, a laptop and a spare desktop, a phone and a friend's computer. The cloud VMs are just a reproducible way to develop and benchmark the networking layer before the hardware is in hand.
 
@@ -10,10 +10,10 @@ DigitalOcean droplets over WireGuard stand in for the real target: two people's 
 
 ## What It Does
 
-A single Llama 3.2-3B model is too large to run comfortably on one small machine. Pipeline parallelism solves this by splitting the transformer layers across machines — each node loads only its slice, and they chain together:
+A single Llama 3.2-3B model is too large to run comfortably on one small machine. Relay solves this by splitting the transformer layers across machines — each node loads only its slice, and they chain together:
 
 ```
-Droplet 0 (Stage 0)              Droplet 1 (Stage 1)
+Node 0 (Stage 0)                 Node 1 (Stage 1)
 ──────────────────────           ──────────────────────
 embed_tokens                     layers [N/2 … N]
 layers [0 … N/2]                 RMSNorm
@@ -28,7 +28,7 @@ Stage 0 also runs a smaller **draft model** (Llama 3.2-1B) for speculative decod
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  Stage 0 (Droplet 0)                                     │
+│  Stage 0                                                 │
 │                                                          │
 │  Draft model (Llama 1B) ──► speculate k tokens           │
 │  Target Stage 0 layers   ──► produce hidden states       │
@@ -42,7 +42,7 @@ Stage 0 also runs a smaller **draft model** (Llama 3.2-1B) for speculative decod
                   WireGuard VPN (10.99.0.0/24)          │
                                                         ▼
 ┌──────────────────────────────────────────────────────────┐
-│  Stage 1 (Droplet 1)                                     │
+│  Stage 1                                                 │
 │                                                          │
 │  Target Stage 1 layers   ──► logits                      │
 │  Accept/reject draft tokens, sample bonus token          │
@@ -52,14 +52,14 @@ Stage 0 also runs a smaller **draft model** (Llama 3.2-1B) for speculative decod
 
 ### Why DigitalOcean as a mock network
 
-Real-world pipeline parallelism runs across machines on different subnets with real network latency, firewall rules, and no shared memory. Running it locally on one machine skips all of that. Two DO droplets on the same region but different VMs give genuine inter-machine communication — bandwidth limits, real TCP round-trips, port routing — while staying cheap and reproducible. WireGuard creates the encrypted overlay network; the pipeline runs on top of it over ZeroMQ sockets.
+Real distributed inference runs across machines on different subnets with real network latency, firewall rules, and no shared memory. Running it locally on one machine skips all of that. Two DO droplets on the same region but different VMs give genuine inter-machine communication — bandwidth limits, real TCP round-trips, port routing — while staying cheap and reproducible. WireGuard creates the encrypted overlay network; Relay runs on top of it over ZeroMQ sockets.
 
 ---
 
 ## Project Structure
 
 ```
-PipeLineParralel/
+relay/
 ├── src/
 │   ├── launch.py       # peer discovery + pipeline launcher (entry point)
 │   ├── worker.py       # per-stage generation loop (speculative + cascade logic)
@@ -68,7 +68,7 @@ PipeLineParralel/
 │   ├── utils.py        # ZMQ socket helpers, tensor send/recv, int8 codec
 │   └── dashboard.py    # live Rich terminal display
 ├── deploy/
-│   ├── deploy.sh       # spin up two DO droplets, wire WireGuard, bootstrap pipeline
+│   ├── deploy.sh       # spin up two DO droplets, wire WireGuard, bootstrap Relay
 │   └── teardown.sh     # delete both droplets
 ├── config.yaml         # model, pipeline, network, and speculative settings
 └── requirements.txt
@@ -91,7 +91,7 @@ Create `deploy/.env`:
 
 ```bash
 DO_TOKEN=your_digitalocean_token
-GITHUB_REPO=youruser/PipeLineParralel
+GITHUB_REPO=youruser/relay
 DO_SSH_KEY=your_ssh_key_fingerprint   # doctl compute ssh-key list
 HF_TOKEN=your_hf_token                # only needed for gated models
 REGION=sfo3
@@ -114,13 +114,13 @@ This will:
 
 ### Run
 
-Once the model download finishes on both droplets (check with `tail -f /var/log/pipeline-models.log`), start the pipeline. **Stage 1 must start first.**
+Once the model download finishes on both droplets (check with `tail -f /var/log/pipeline-models.log`), start Relay. **Stage 1 must start first.**
 
 ```bash
-# tmux pane — Droplet 1 (Stage 1)
+# tmux pane — Node 1 (Stage 1)
 /opt/pipeline/start.sh
 
-# tmux pane — Droplet 0 (Stage 0)
+# tmux pane — Node 0 (Stage 0)
 /opt/pipeline/start.sh --prompt "the future of computing is"
 ```
 
@@ -200,7 +200,7 @@ sudo ufw allow 5550:5560/tcp
 
 ## How Speculative Decoding Works Here
 
-Standard autoregressive decoding sends one token at a time through the full pipeline — slow, because each token is a full network round-trip. Speculative decoding drafts `k` tokens with the cheap 1B model, then sends them all to Stage 1 at once. Stage 1 runs one forward pass over all `k+1` positions and either accepts each draft token (if the target agrees) or rejects and resamples from that point. On a typical good-confidence step you get 3–5 tokens accepted per round-trip instead of 1.
+Standard autoregressive decoding sends one token at a time through the full pipeline — slow over WAN, because each token is a full network round-trip. Relay uses speculative decoding to draft `k` tokens with the cheap 1B model, then sends them all to Stage 1 at once. Stage 1 runs one forward pass over all `k+1` positions and either accepts each draft token (if the target agrees) or rejects and resamples from that point. On a typical good-confidence step you get 3–5 tokens accepted per round-trip instead of 1.
 
 The cascade layer short-circuits even further: if the draft's confidence is high enough (≥ 0.9 top-1 probability), Stage 0 accepts the token locally and buffers the hidden states. These get flushed in a batch on the next network send, so Stage 1 stays in sync without a per-token round-trip.
 
