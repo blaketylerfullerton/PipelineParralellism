@@ -45,7 +45,8 @@ wait_for_models() {
     echo "  Waiting for models on $label ($host)..."
     while true; do
         local last
-        last=$(timeout 15 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes \
+        last=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes \
+            -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
             root@"$host" "tail -1 /var/log/pipeline-models.log 2>/dev/null || echo NOLOG" 2>&1 || echo "SSH_ERR")
 
         if [[ "$last" == "SSH_ERR"* ]] || [[ "$last" == *"Permission denied"* ]]; then
