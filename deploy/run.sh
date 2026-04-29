@@ -35,23 +35,34 @@ if [[ -z "$PROMPT" ]]; then
     exit 1
 fi
 
-SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes"
+SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=3"
 
 # ── wait for model downloads ──────────────────────────────────────────────────
 wait_for_models() {
     local host="$1"
     local label="$2"
+    local attempts=0
     echo "  Waiting for models on $label ($host)..."
     while true; do
         local last
-        last=$(${SSH} root@"$host" "tail -1 /var/log/pipeline-models.log 2>/dev/null || echo ''" 2>/dev/null || echo "")
-        if [[ "$last" == *"[dl] Done"* ]]; then
+        last=$(timeout 15 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes \
+            root@"$host" "tail -1 /var/log/pipeline-models.log 2>/dev/null || echo NOLOG" 2>&1 || echo "SSH_ERR")
+
+        if [[ "$last" == "SSH_ERR"* ]] || [[ "$last" == *"Permission denied"* ]]; then
+            attempts=$((attempts + 1))
+            echo "  [$label] SSH not ready yet (attempt $attempts) — retrying in 15s..."
+            sleep 15
+            continue
+        fi
+
+        # grep avoids the [dl] glob-character-class pitfall
+        if echo "$last" | grep -q '\[dl\] Done'; then
             echo "  Models ready on $label"
             return 0
         fi
-        # print progress without flooding
-        if [[ -n "$last" ]]; then
-            printf "\r  %-60s" "$label: $last"
+
+        if [[ "$last" != "NOLOG" ]] && [[ -n "$last" ]]; then
+            printf "\r  %-70s" "$label: $last"
         fi
         sleep 10
     done
