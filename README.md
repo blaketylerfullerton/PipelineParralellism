@@ -1,4 +1,4 @@
-<p align="center"><img src="images/networking1.png" width="600"/></p>
+<p align="center"><img src="images/networking1.png" width="300"/></p>
 
 
 # Relay
