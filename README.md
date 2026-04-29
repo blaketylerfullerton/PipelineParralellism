@@ -1,4 +1,4 @@
-![Networking](images/networking1.png)
+<p align="center"><img src="images/networking1.png" width="600"/></p>
 
 
 # Relay
@@ -9,7 +9,7 @@ Most distributed ML research assumes you have a high-bandwidth, low-latency inte
 
 DigitalOcean droplets over WireGuard stand in for the real target: two people's laptops, a laptop and a spare desktop, a phone and a friend's computer. The cloud VMs are just a reproducible way to develop and benchmark the networking layer before the hardware is in hand.
 
-![Relay architecture](images/diagram.png)
+<p align="center"><img src="images/diagram.png" width="700"/></p>
 
 ---
 
