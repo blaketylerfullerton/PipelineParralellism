@@ -49,9 +49,14 @@ wait_for_models() {
             -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
             root@"$host" "tail -1 /var/log/pipeline-models.log 2>/dev/null || echo NOLOG" 2>&1 || echo "SSH_ERR")
 
-        if [[ "$last" == "SSH_ERR"* ]] || [[ "$last" == *"Permission denied"* ]]; then
+        if [[ "$last" == "SSH_ERR"* ]] || [[ "$last" == *"Permission denied"* ]] || [[ "$last" == *"Connection refused"* ]]; then
             attempts=$((attempts + 1))
-            echo "  [$label] SSH not ready yet (attempt $attempts) — retrying in 15s..."
+            echo "  [$label] SSH failed (attempt $attempts): ${last/SSH_ERR/connection error}"
+            if [[ $attempts -eq 3 ]]; then
+                echo ""
+                echo "  HINT: If this keeps failing, check that DO_SSH_KEY is set in deploy/.env"
+                echo "  Test manually: ssh root@$host"
+            fi
             sleep 15
             continue
         fi
