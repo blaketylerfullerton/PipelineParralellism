@@ -30,7 +30,7 @@ done
 : "${GITHUB_REPO:?Set GITHUB_REPO (e.g. youruser/PipeLineParralel)}"
 HF_TOKEN="${HF_TOKEN:-}"
 DO_SSH_KEY="${DO_SSH_KEY:-}"
-REGION="${REGION:-nyc3}"
+REGION="${REGION:-sfo3}"
 SIZE="${SIZE:-s-4vcpu-8gb}"
 
 export DIGITALOCEAN_ACCESS_TOKEN="$DO_TOKEN"
@@ -69,7 +69,7 @@ make_cloud_init() {
 
     # Base64-encode start.sh content so "$@" survives the heredoc expansion chain
     local _start_b64
-    _start_b64=$(printf '#!/bin/bash\ncd /opt/pipeline\nsource .venv/bin/activate\nexec python launch.py --stage %s --peer-ip %s %s "$@"\n' \
+    _start_b64=$(printf '#!/bin/bash\ncd /opt/pipeline\nsource .venv/bin/activate\nexec python src/launch.py --stage %s --peer-ip %s %s "$@"\n' \
         "${stage}" "${WG0_IP}" "${WG1_IP}" | base64)
 
     cat <<CLOUDINIT

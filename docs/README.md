@@ -85,24 +85,25 @@ Tensors are serialized as raw numpy bytes — `tensor.numpy().tobytes()` with sh
 
 ```
 PipeLineParralel/
-├── launch.py       # auto-discovery + pipeline launcher (start here)
-├── worker.py       # generation loop logic (one instance per machine)
-├── model.py        # splits GPT-2 into stage slices (Stage0Module, LastModule)
-├── utils.py        # ZMQ socket factories + tensor send/recv
-├── dashboard.py    # live Rich terminal display
-├── config.yaml     # pipeline config (stages, ports, model name)
+├── src/
+│   ├── launch.py       # auto-discovery + pipeline launcher (start here)
+│   ├── worker.py       # generation loop logic (one instance per machine)
+│   ├── model.py        # splits GPT-2 into stage slices (Stage0Module, LastModule)
+│   ├── utils.py        # ZMQ socket factories + tensor send/recv
+│   └── dashboard.py    # live Rich terminal display
+├── config.yaml         # pipeline config (stages, ports, model name)
 └── requirements.txt
 ```
 
 ### How the pieces connect
 
 ```
-launch.py
+src/launch.py
   └── DiscoveryManager   discovers peers via UDP broadcast
-  └── worker.py          runs the generation loop for this stage
-       └── model.py      loads only this stage's slice of GPT-2
-       └── utils.py      handles all network communication
-       └── dashboard.py  shows live status in the terminal
+  └── src/worker.py      runs the generation loop for this stage
+       └── src/model.py      loads only this stage's slice of GPT-2
+       └── src/utils.py      handles all network communication
+       └── src/dashboard.py  shows live status in the terminal
 ```
 
 ---
@@ -127,10 +128,10 @@ pip install -r requirements.txt
 
 ```bash
 # Terminal 2
-python launch.py --stage 1 --stages 2
+python src/launch.py --stage 1 --stages 2
 
 # Terminal 1 (start last — this one asks for the prompt)
-python launch.py --stage 0 --stages 2
+python src/launch.py --stage 0 --stages 2
 ```
 
 ### Two machines on the same network (auto-discovery)
@@ -139,10 +140,10 @@ Both machines must be on the same subnet for UDP broadcast to work.
 
 ```bash
 # Machine B (server — start first)
-python launch.py --stage 1 --stages 2
+python src/launch.py --stage 1 --stages 2
 
 # Machine A (driver — start second, will ask for prompt)
-python launch.py --stage 0 --stages 2
+python src/launch.py --stage 0 --stages 2
 ```
 
 The discovery panel lights up green when each machine comes online.
@@ -162,29 +163,29 @@ hostname -I            # local LAN IP
 Then on both machines, provide all IPs in stage order:
 ```bash
 # Server (Stage 1) — run first
-python launch.py --stage 1 --stages 2 --peer-ip <stage0-ip> <stage1-ip>
+python src/launch.py --stage 1 --stages 2 --peer-ip <stage0-ip> <stage1-ip>
 
 # Mac (Stage 0) — run second
-python launch.py --stage 0 --stages 2 --peer-ip <stage0-ip> <stage1-ip>
+python src/launch.py --stage 0 --stages 2 --peer-ip <stage0-ip> <stage1-ip>
 ```
 
 Example with Tailscale:
 ```bash
-python launch.py --stage 1 --stages 2 --peer-ip 100.76.11.94 100.76.230.67
-python launch.py --stage 0 --stages 2 --peer-ip 100.76.11.94 100.76.230.67
+python src/launch.py --stage 1 --stages 2 --peer-ip 100.76.11.94 100.76.230.67
+python src/launch.py --stage 0 --stages 2 --peer-ip 100.76.11.94 100.76.230.67
 ```
 
 ### 3 machines
 
 ```bash
 # Machine C (stage 2)
-python launch.py --stage 2 --stages 3 --peer-ip <ip0> <ip1> <ip2>
+python src/launch.py --stage 2 --stages 3 --peer-ip <ip0> <ip1> <ip2>
 
 # Machine B (stage 1)
-python launch.py --stage 1 --stages 3 --peer-ip <ip0> <ip1> <ip2>
+python src/launch.py --stage 1 --stages 3 --peer-ip <ip0> <ip1> <ip2>
 
 # Machine A (stage 0, driver)
-python launch.py --stage 0 --stages 3 --peer-ip <ip0> <ip1> <ip2>
+python src/launch.py --stage 0 --stages 3 --peer-ip <ip0> <ip1> <ip2>
 ```
 
 ---
