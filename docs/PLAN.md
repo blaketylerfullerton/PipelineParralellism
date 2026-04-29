@@ -201,27 +201,32 @@ Tradeoff: you lose the educational from-scratch aspect of this repo, but you gai
 
 ## Sequencing
 
-| Phase | Effort | Speedup on top of previous | Cumulative TPS target (70B-class, 3 machines, 40ms RTT) |
+| Phase | Effort | Result | Measured TPS |
 |---|---|---|---|
-| Baseline (current code) | — | 1x | ~0.3 TPS |
-| ~~1.1 KV cache~~ ✅ | 2–3 days | 1.7× measured (192→112 ms/tok) | ~1 TPS |
-| ~~1.2 int8 activations~~ ✅ | 1 day | 1.3x | ~1.3 TPS |
-| ~~1.3 Async overlap~~ ✅ | 2 days | 1.3x | ~1.7 TPS |
-| ~~2. Speculative decoding~~ ✅ | 1–2 weeks | measured with same-model test | ~5 TPS |
-| 2.5 Speculative pipelining | 1 day | 1.06–1.10x | ~5.5 TPS |
-| 3. MoE architecture | 2–4 weeks | 1.5–2x | ~8 TPS |
-| ~~4.2 Cascade~~ ✅ | 3 days | 1.5x | ~12 TPS |
+| Baseline (GPT-2, no cache) | — | — | ~0.3 TPS |
+| ~~1.1 KV cache~~ ✅ | 2–3 days | 1.7× (192→112 ms/tok on GPT-2) | ~0.5 TPS |
+| ~~1.2 int8 activations~~ ✅ | 1 day | 1.3× | ~0.7 TPS |
+| ~~1.3 Async overlap~~ ✅ | 2 days | buffer tuning only | ~0.7 TPS |
+| ~~1.4 Switch to Llama 3.2-3B~~ ✅ | 1 day | real model, pipeline unchanged | — |
+| ~~2. Speculative decoding~~ ✅ | 1–2 weeks | 77% acceptance rate, k=6 | **1.10 TPS** |
+| ~~4.2 Cascade~~ ✅ | 3 days | 29% steps local, stacks with spec | included above |
+| 2.5 Speculative pipelining | 1 day | ~6–10% on top (draft hides in wait) | ~1.2 TPS |
+| **3. MoE architecture** | 2–4 weeks | biggest remaining lever | ~4–8 TPS |
+| 4.1 Prefill/decode split | 1 week | asymmetric hardware benefit | ~+20% |
+| 4.3 Microbatching / 1F1B | 1–2 weeks | only helps multi-user | — |
 
-Phase 1 is pure refactor of the existing code — do it before anything else, in order. Phase 2 is the highest leverage new feature. Phase 3 is a real rewrite; only do it after Phase 2 proves the rest of the stack works.
+**Current status: bottleneck is CPU memory bandwidth, not network.** Spec pipelining is the next easy win. MoE is the architectural unlock.
 
 ---
 
 ## Milestones / exit criteria
 
-- **M1 — Phase 1 complete**: generating 30 tokens of GPT-2 medium across two WireGuard machines at ≥2 TPS with KV cache and int8 activations.
-- **M2 — Speculative decoding working**: same setup, ≥5 TPS on GPT-2 large with a GPT-2 small draft model, with acceptance rate logged in the dashboard.
-- **M3 — MoE sharded inference**: Mixtral 8x7B Q4 running across 3 machines, ≥4 TPS end-to-end.
-- **M4 — Cascade + everything**: 8+ TPS on a 70B-equivalent MoE workload across 3 WAN machines. Ship it.
+- **~~M1 — Phase 1 complete~~** ✅: KV cache + int8 activations running on Llama 3.2-3B across two WireGuard droplets.
+- **~~M2 — Speculative decoding working~~** ✅: 77.1% acceptance rate, 1.10 TPS measured on 2× s-8vcpu-16gb, Llama 3.2-3B with 1B draft.
+- **M3 — Speculative pipelining**: draft time hidden inside WAN wait window, ~1.2 TPS target.
+- **M4 — MoE sharded inference**: Mixtral 8x7B Q4 or Qwen-MoE running across 3 machines, ≥4 TPS end-to-end.
+- **M5 — WAN across different ISPs**: two machines on genuinely different networks (not same-region DO), ≥2 TPS. This is the real test of the research thesis.
+- **M6 — Consumer hardware**: run on actual laptops / desktops over the internet, not cloud VMs.
 
 ---
 
