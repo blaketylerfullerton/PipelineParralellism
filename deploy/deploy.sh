@@ -31,7 +31,7 @@ done
 HF_TOKEN="${HF_TOKEN:-}"
 DO_SSH_KEY="${DO_SSH_KEY:-}"
 REGION="${REGION:-sfo3}"
-SIZE="${SIZE:-s-4vcpu-8gb}"
+SIZE="${SIZE:-s-8vcpu-16gb}"
 
 export DIGITALOCEAN_ACCESS_TOKEN="$DO_TOKEN"
 IMAGE="ubuntu-24-04-x64"
@@ -237,4 +237,22 @@ echo "    ssh root@$IP0 ping -c 3 $WG1_IP"
 echo ""
 echo "  Tear down:  ./teardown.sh"
 echo "════════════════════════════════════════════════════════"
+
+# ── auto SSH ─────────────────────────────────────────────────────────────────
+SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
+
+if command -v tmux &>/dev/null; then
+    echo ""
+    echo "Opening tmux session with both droplets (Ctrl-B arrow to switch panes)..."
+    tmux new-session -d -s pipeline -x "$(tput cols)" -y "$(tput lines)" \
+        "ssh $SSH_OPTS root@$IP0"
+    tmux split-window -h -t pipeline \
+        "ssh $SSH_OPTS root@$IP1"
+    tmux select-pane -t pipeline:0.0
+    exec tmux attach-session -t pipeline
+else
+    echo ""
+    echo "Connecting to Stage 0 (open a second terminal for Stage 1: ssh root@$IP1)..."
+    exec ssh $SSH_OPTS root@"$IP0"
+fi
 
