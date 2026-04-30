@@ -137,6 +137,11 @@ def generation_loop(
         cascade_hits = 0
         cascade_hidden_buf: list = []  # accumulated Stage-0 hiddens not yet sent to Stage N
 
+        # Speculative pipeline prefetch tracking
+        pipeline_hits = 0
+        pipeline_steps = 0  # spec (non-cascade) steps only
+        _pipeline_assumed_seed: Optional[int] = None  # seed used in last start_prefetch
+
         while tokens_generated < max_new_tokens:
             is_prefill = (spec_step == 0)
             t0 = time.perf_counter()
@@ -174,15 +179,37 @@ def generation_loop(
                 last_tok = generated[:, -1:]  # (1,1) — not yet in KV cache
                 kv_before = kv_len
 
-                # Peek at first draft token — use max_prob (distribution peak) for
-                # cascade decision, not sampled_prob (which can be low even when
-                # the model is very confident about one token)
+                # --- Phase 2.5: consume any pipeline-prefetched draft from previous round.
+                # This always joins the background thread (if one is running) BEFORE the
+                # main thread does any model inference, preventing concurrent model use.
+                prefetch_result = None
+                if _pipeline_assumed_seed is not None:
+                    prefetch_result = draft_model.consume_prefetch(
+                        actual_seed_id=last_tok[0, 0].item(),
+                        assumed_seed_id=_pipeline_assumed_seed,
+                    )
+                    _pipeline_assumed_seed = None
+
+                # Peek at first draft token (or extract from prefetch).
+                # Use max_prob (distribution peak) for cascade decisions.
                 t_draft_start = time.perf_counter()
-                d0_tokens, d0_prob_sampled, d0_prob_max = draft_model.draft_peek(last_tok)
-                d0_probs = torch.tensor([d0_prob_sampled])
+                if prefetch_result is not None:
+                    pf_tokens, pf_probs, pf_max_probs, pf_kv = prefetch_result
+                    d0_tokens = pf_tokens[:, :1]
+                    d0_probs = pf_probs[:1]
+                    d0_prob_max = pf_max_probs[0].item()
+                else:
+                    d0_tokens, d0_prob_sampled, d0_prob_max = draft_model.draft_peek(last_tok)
+                    d0_probs = torch.tensor([d0_prob_sampled])
 
                 if cascade_enabled and d0_prob_max >= cascade_threshold:
                     # ---- Cascade: accept locally, buffer hidden for later batch send ----
+                    if prefetch_result is not None:
+                        # draft_peek was skipped — manually advance the draft KV by one
+                        # so it stays in sync with the token we're about to accept.
+                        draft_model.advance_cache(last_tok[0, 0].item())
+                        # pf_kv is discarded (it's k positions ahead, inconsistent now)
+
                     t_fwd_start = time.perf_counter()
                     with torch.no_grad():
                         hidden, stage_kv = stage_model(last_tok, past_key_values=stage_kv)
@@ -202,14 +229,26 @@ def generation_loop(
                     cascade_hits += 1
 
                 else:
-                    # ---- Speculative decode: draft k-1 more, then verify with pipeline ----
-                    if k > 1:
-                        rest_tokens, rest_probs = draft_model.draft_k_tokens(d0_tokens[:, -1:], k - 1)
-                        draft_tokens_t = torch.cat([d0_tokens, rest_tokens], dim=1)  # (1, k)
-                        draft_probs_t = torch.cat([d0_probs, rest_probs])
+                    # ---- Speculative decode: build k-draft batch, verify with pipeline ----
+                    if prefetch_result is not None:
+                        # All k draft tokens came from the background prefetch — free ride.
+                        draft_tokens_t = pf_tokens   # (1, k)
+                        draft_probs_t = pf_probs     # (k,)
+                        # Adopt the prefetch's KV (it already processed seed + k tokens).
+                        draft_model._kv = pf_kv
+                        pipeline_hits += 1
                     else:
-                        draft_tokens_t = d0_tokens
-                        draft_probs_t = d0_probs
+                        # Draft k-1 more tokens beyond d0.
+                        if k > 1:
+                            rest_tokens, rest_probs, _ = draft_model.draft_k_tokens(
+                                d0_tokens[:, -1:], k - 1)
+                            draft_tokens_t = torch.cat([d0_tokens, rest_tokens], dim=1)  # (1, k)
+                            draft_probs_t = torch.cat([d0_probs, rest_probs])
+                        else:
+                            draft_tokens_t = d0_tokens
+                            draft_probs_t = d0_probs
+
+                    pipeline_steps += 1
 
                     t_fwd_start = time.perf_counter()
                     feed = torch.cat([last_tok, draft_tokens_t], dim=1)  # (1, k+1)
@@ -223,13 +262,17 @@ def generation_loop(
                         hidden = torch.cat(cascade_hidden_buf + [hidden], dim=1)
                         cascade_hidden_buf.clear()
 
-                    t_send = time.perf_counter()
                     send_msg(sockets["push"], make_activation_msg(
                         spec_step, 0, hidden, is_prefill=False, codec=codec,
                         draft_tokens=draft_tokens_t[0].tolist(),
                         cascade_prefix_len=cascade_prefix_len))
                     _dash_update(state="forward", current_step=tokens_generated)
                     _publish(sockets["pub"], 0, host, spec_step, "forward", 0, tokens_generated)
+
+                    # Phase 2.5: launch next-round draft in background while we wait.
+                    # Optimistic seed = last draft token (assumes all k accepted, no bonus).
+                    _pipeline_assumed_seed = draft_tokens_t[0, k - 1].item()
+                    draft_model.start_prefetch(draft_tokens_t[:, -1:], k)
 
                     t_wait_start = time.perf_counter()
                     msg = None
@@ -277,7 +320,8 @@ def generation_loop(
                     draft_ms = (t_fwd_start - t_draft_start) * 1000
                     fwd_ms = (t_fwd_end - t_fwd_start) * 1000
                     wait_ms = (t_wait_end - t_wait_start) * 1000
-                    print(f"\n[Step {spec_step:3d}] SPEC     draft={draft_ms:.0f}ms  fwd={fwd_ms:.0f}ms  wait={wait_ms:.0f}ms  acc={M}/{k}  {per_tok_ms:.0f}ms/tok", flush=True)
+                    pipe_tag = " [PF]" if prefetch_result is not None else ""
+                    print(f"\n[Step {spec_step:3d}] SPEC{pipe_tag}    draft={draft_ms:.0f}ms  fwd={fwd_ms:.0f}ms  wait={wait_ms:.0f}ms  acc={M}/{k}  {per_tok_ms:.0f}ms/tok", flush=True)
 
                     new_tokens_t = torch.tensor([accepted], dtype=torch.long)
                     generated = torch.cat([generated, new_tokens_t], dim=1)
@@ -322,12 +366,15 @@ def generation_loop(
         print(f"\n\n[Stage 0] Done. {tokens_generated} tokens, avg {avg_ms:.1f} ms/token ({tps:.2f} TPS)")
         if spec_enabled and spec_steps_total > 0:
             avg_acc = accepted_total / spec_steps_total
-            print(f"[Stage 0] Spec:    avg {avg_acc:.2f} tokens/step  "
+            print(f"[Stage 0] Spec:     avg {avg_acc:.2f} tokens/step  "
                   f"(k={k}, acceptance={avg_acc / (k + 1):.1%})")
         if cascade_enabled:
             total_steps = cascade_hits + spec_steps_total
             pct = cascade_hits / max(total_steps, 1) * 100
-            print(f"[Stage 0] Cascade: {cascade_hits}/{total_steps} steps handled locally ({pct:.0f}%)")
+            print(f"[Stage 0] Cascade:  {cascade_hits}/{total_steps} steps handled locally ({pct:.0f}%)")
+        if spec_enabled and pipeline_steps > 0:
+            hit_pct = pipeline_hits / pipeline_steps * 100
+            print(f"[Stage 0] Pipeline: {pipeline_hits}/{pipeline_steps} spec steps used prefetch ({hit_pct:.0f}%)")
         _dash_update(state="done", current_step=tokens_generated)
         _publish(sockets["pub"], 0, host, spec_step, "done", avg_ms, tokens_generated)
 
