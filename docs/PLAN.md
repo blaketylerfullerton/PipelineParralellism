@@ -1,6 +1,6 @@
 # Distributed Inference — Latency Mitigation Plan
 
-Goal: make pipeline parallelism across WAN-connected CPU machines (WireGuard, different ISPs) actually usable. Starting point was the GPT-2 pipeline in this repo — dense, no KV cache, raw-bytes ZMQ, fully sequential round-trip per token. Current state is Llama-3.2-3B with KV cache, int8 wire compression, speculative decoding (k=6, ~77% acceptance), and cascade fast-path (~29% local steps).
+Goal: make pipeline parallelism across WAN-connected CPU machines (WireGuard, different ISPs) actually usable. Starting point was the GPT-2 pipeline in this repo — dense, no KV cache, raw-bytes ZMQ, fully sequential round-trip per token. Current state is Llama-3.2-3B with KV cache, int8 wire compression, speculative decoding (k=6, ~77% acceptance), cascade fast-path (~29% local steps), and speculative pipeline prefetch (draft overlapped with verifier wait).
 
 Realistic target after the full stack: **3–8 TPS for a 70B-equivalent model on 2–3 CPU machines across different internets.** Interactive-ish, not snappy. Good enough for agent workflows.
 
@@ -128,11 +128,11 @@ Stacks with speculative decoding: local cascade handles easy tokens, speculative
 
 ---
 
-## Phase 2.5 — Speculative pipelining *(next implementation target)*
+## ~~Phase 2.5 — Speculative pipelining~~ ✅ DONE
 
 ### Concept
 
-Stage 0 currently goes idle the moment it fires its activation message — it just blocks on `recv_msg` waiting for Stage 1 to verify. **That idle window is ~3,200 ms** in the current config (Stage 1 verifier compute), and the next round's draft will cost ~1,200 ms. If we launch the next draft in a background thread the moment we send the verifier batch, Python's GIL is released while the main thread blocks on ZMQ's C-level `poll()`, so PyTorch can run the draft in parallel.
+Stage 0 goes idle the moment it fires its activation message — it just blocks on `recv_msg` waiting for Stage 1 to verify. **That idle window is ~3,200 ms** in the current config (Stage 1 verifier compute), and the next round's draft costs ~1,200 ms. By launching the next draft in a background thread the moment we send the verifier batch, Python's GIL is released while the main thread blocks on ZMQ's C-level `poll()`, so PyTorch can run the draft in parallel.
 
 ```
 draft (1200ms) → stage0 fwd (650ms) → send → recv-wait (3200ms) → accept/reject
@@ -147,7 +147,7 @@ On a hit, the draft cost disappears from the next round's critical path entirely
 
 To pre-draft round N+1 during round N's wait, you need to know what token to start drafting from — the "seed." But the seed depends on round N's accept/reject outcome, which only arrives with the verifier response.
 
-The pragmatic solution: assume an **optimistic seed** (the last drafted token, `draft_tokens[K-1]`). If accept/reject confirms it, adopt the prefetched draft. If not, discard and re-draft normally — the worst case is identical to today's behavior, so this is risk-free.
+Solution: assume an **optimistic seed** (the last drafted token, `draft_tokens[K-1]`). If accept/reject confirms it, adopt the prefetched draft. If not, discard and re-draft normally — the worst case is identical to pre-2.5 behavior.
 
 Hit-rate expectations at ~0.77 per-token acceptance:
 
@@ -159,7 +159,7 @@ Hit-rate expectations at ~0.77 per-token acceptance:
 
 ### Why this is more valuable than the original projection said
 
-The original `SPECULATIVE_PIPELINE.md` (now retired into this doc) projected ~6–10% TPS gain because it modeled the overlap window as the WAN RTT (~80 ms). That was correct under network-bound assumptions. Under the current compute-bound regime:
+The original `SPECULATIVE_PIPELINE.md` (now retired into this doc) projected ~6–10% TPS gain because it modeled the overlap window as the WAN RTT (~80 ms). Under the current compute-bound regime:
 
 ```
 hit_rate × draft_time_saved / round_time
@@ -175,14 +175,12 @@ But that's the *average* — on hits it's ~24% per round. So:
 | With tree speculation (~55–65% hit) | ~35–45% |
 | After Phase 1.6 quantization (verifier wait shrinks to ~1,000 ms) | drops back to ~6–10% |
 
-**Order matters.** Do speculative pipelining *before* weight quantization to capture the full gain while the verifier wait window is still big. After quantization, the draft no longer fits inside the wait, and this optimization's relative value collapses.
+**Order matters.** Speculative pipelining was landed *before* weight quantization to capture the full gain while the verifier wait window is still large.
 
-### Implementation sketch
+### What we did
 
-- **`draft.py`**: add `start_prefetch(seed, k)` that snapshots the KV cache and launches a daemon thread running `draft_k_tokens` from the optimistic seed. Add `consume_prefetch(actual_seed_id, assumed_seed_id)` that joins the thread and returns the cached result on match, `None` on mismatch.
-- **`worker.py`** (Stage 0 spec branch, around `worker.py:230`): after `send_msg`, call `draft_model.start_prefetch(draft_tokens_t[:, -1:], k)`. Block on `recv_msg` as normal. After accept/reject, call `consume_prefetch` and either adopt the pre-draft or discard.
-- The thread holds a *cloned* KV cache, so there is no shared mutable state. Join happens before any KV manipulation in the main thread.
-- Add a `pipeline_hits / pipeline_steps` counter to the end-of-generation summary.
+- **`draft.py`**: extracted `_draft_k_tokens_on_cache()` as a thread-safe free function that operates on a KV snapshot with no shared instance state. Added `start_prefetch(seed, k)` — deep-copies the current KV cache and launches a daemon thread (`spec_prefetch`) running the free function from the optimistic seed. Added `consume_prefetch(actual_seed_id, assumed_seed_id)` — joins the thread and returns `(tokens, sampled_probs, max_probs, final_kv)` on a seed match, `None` on mismatch. `draft_k_tokens` refactored to call the same free function and now also returns `max_probs` (needed for cascade threshold decisions).
+- **`worker.py`** (Stage 0 spec branch): after `send_msg`, calls `draft_model.start_prefetch(draft_tokens_t[:, -1:], k)` and stores the optimistic seed. At the top of the *next* spec step, calls `consume_prefetch` before any model inference — guaranteeing the thread is joined before the main thread touches the model. On a hit, adopts the prefetch's `(tokens, probs, kv)` and skips drafting entirely. On a miss or cascade step, falls through to the normal drafting path. `pipeline_hits / pipeline_steps` is tracked and printed in the end-of-generation summary as `Pipeline: N/M spec steps used prefetch (X%)`.
 
 ### Tree speculation upgrade (later, ~1–2 weeks)
 
@@ -251,6 +249,17 @@ Only helps for multi-user serving (agent workflows, API server). Skip for single
 
 CPU-only right now. Becomes relevant if any machine gets a GPU.
 
+### Local development (`run_local.sh`) ✅ DONE
+
+Added `deploy/run_local.sh` — runs both pipeline stages on a single machine without any cloud deploy. Opens a split tmux session (Stage 1 left, Stage 0 right) connected over `127.0.0.1`. Both stages use the existing venv and pull models from HuggingFace cache. Useful for rapid iteration without waiting on DigitalOcean provisioning.
+
+```bash
+./deploy/run_local.sh --prompt "your prompt"
+# or manually in two terminals:
+python src/launch.py --stage 1 --peer-ip 127.0.0.1 127.0.0.1
+python src/launch.py --stage 0 --peer-ip 127.0.0.1 127.0.0.1 --prompt "..."
+```
+
 ---
 
 ## Sequencing
@@ -264,7 +273,7 @@ CPU-only right now. Becomes relevant if any machine gets a GPU.
 | ~~1.4 Switch to Llama 3.2-3B~~ ✅ | 1 day | real model | — |
 | ~~2. Speculative decoding~~ ✅ | 1–2 weeks | 77% acceptance, k=6 | **1.10 TPS** |
 | ~~4.2 Cascade~~ ✅ | 3 days | 29% steps local | included above |
-| **2.5 Speculative pipelining** | 1–2 days | hides 1.2s draft in 3.2s wait | **~1.35 TPS** |
+| ~~**2.5 Speculative pipelining**~~ ✅ | 1–2 days | hides 1.2s draft in 3.2s wait | **~1.35 TPS** |
 | **1.6 Weight quantization (int8)** | 3–5 days | ~2× memory bandwidth | **~1.8 TPS** |
 | **Path A vs B decision point** | — | choose based on int8 result | — |
 | 1.6b GGUF Q4 (Path B only) | 1–2 weeks | port onto llama.cpp RPC | ~2.5–3 TPS |
@@ -273,7 +282,7 @@ CPU-only right now. Becomes relevant if any machine gets a GPU.
 | 4.1 Prefill/decode split | 1 week | asymmetric hardware only | — |
 | 4.3 Microbatching / 1F1B | 1–2 weeks | multi-user only | — |
 
-**Current status:** bottleneck is CPU memory bandwidth, not network. Speculative pipelining is the next easy win and must land *before* quantization to capture the full overlap gain. Weight quantization is the next big lever. MoE is deferred until Q4 dense is exhausted.
+**Current status:** bottleneck is CPU memory bandwidth, not network. Speculative pipelining is done — hit rate and TPS gain TBD from live measurements. Weight quantization (Phase 1.6) is the next big lever. MoE is deferred until Q4 dense is exhausted.
 
 ---
 
@@ -281,7 +290,7 @@ CPU-only right now. Becomes relevant if any machine gets a GPU.
 
 - **~~M1 — Phase 1 complete~~** ✅: KV cache + int8 activations on Llama 3.2-3B across two WireGuard droplets.
 - **~~M2 — Speculative decoding working~~** ✅: 77.1% acceptance, 1.10 TPS on 2× s-8vcpu-16gb, Llama 3.2-3B with 1B draft.
-- **M3 — Speculative pipelining**: draft hidden inside verifier wait, ~1.35 TPS target, `pipeline_hits` counter validates ≥20%.
+- **~~M3 — Speculative pipelining~~** ✅: draft hidden inside verifier wait. `pipeline_hits` counter live; target ≥20% hit rate on longer prompts.
 - **M3.5 — Weight quantization**: int8 dynamic quant in HF (Path A) gets to ≥1.7 TPS, OR triggers move to Path B.
 - **M4 — Q4 dense ceiling**: whichever path wins, measure the absolute ceiling for dense-pipeline-parallel + spec + cascade. This is the number MoE has to beat.
 - **M5 — WAN across different ISPs**: two machines on genuinely different networks (not same-region DO), ≥2 TPS. Real test of the research thesis.
