@@ -41,6 +41,8 @@ logs/
 *.err
 output/
 results/
+deploy/.deploy-state
+deploy/state.json
 
 # Environment variables / secrets
 .env

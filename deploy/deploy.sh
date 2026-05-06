@@ -1,113 +1,149 @@
 #!/usr/bin/env bash
-# deploy.sh — spin up two DO droplets, wire them with WireGuard, bootstrap the pipeline
+# deploy.sh — spin up DO droplets, full-mesh WireGuard, bootstrap the pipeline
 #
-# Required env vars:
+# Required (in deploy/.env):
 #   DO_TOKEN       DigitalOcean API token
-#   GITHUB_REPO    owner/repo  (e.g. youruser/PipeLineParralel)
+#   GITHUB_REPO    owner/repo  (e.g. blaketylerfullerton/PipeLineParralel)
 #
-# Optional env vars:
+# Optional:
 #   HF_TOKEN       HuggingFace token (needed if models are gated)
-#   DO_SSH_KEY     Fingerprint or name of your DO SSH key
-#                  (run: doctl compute ssh-key list)
-#   REGION         Defaults to nyc3
-#   SIZE           Defaults to s-4vcpu-8gb
+#   DO_SSH_KEY     Fingerprint of your DO SSH key  (doctl compute ssh-key list)
+#   REGION         Defaults to sfo3
+#   SIZE           Defaults to s-8vcpu-16gb
+#   NUM_STAGES     Defaults to pipeline.num_stages in config.yaml
+#   CONFIG_FILE    Defaults to ../config.yaml
 set -euo pipefail
 
-# ── output helpers ────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
 log()  { echo -e "${BOLD}▶ $*${NC}"; }
 ok()   { echo -e "${GREEN}✓ $*${NC}"; }
 warn() { echo -e "${YELLOW}⚠ $*${NC}"; }
 err()  { echo -e "${RED}✗ $*${NC}"; exit 1; }
 
-# ── load .env if present ─────────────────────────────────────────────────────
-ENV_FILE="$(dirname "$0")/.env"
-if [[ -f "$ENV_FILE" ]]; then
-    set -o allexport
-    source "$ENV_FILE"
-    set +o allexport
-fi
+# ── load .env ────────────────────────────────────────────────────────────────
+DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$DIR/.." && pwd)"
+ENV_FILE="$DIR/.env"
+[[ -f "$ENV_FILE" ]] && { set -o allexport; source "$ENV_FILE"; set +o allexport; }
 
 # ── prerequisites ────────────────────────────────────────────────────────────
-for cmd in doctl wg; do
+for cmd in doctl wg python3; do
     command -v "$cmd" &>/dev/null || err "$cmd not found. Install it first."
 done
 
-: "${DO_TOKEN:?Set DO_TOKEN}"
-: "${GITHUB_REPO:?Set GITHUB_REPO (e.g. youruser/PipeLineParralel)}"
+: "${DO_TOKEN:?Set DO_TOKEN in deploy/.env}"
+: "${GITHUB_REPO:?Set GITHUB_REPO in deploy/.env}"
 HF_TOKEN="${HF_TOKEN:-}"
 DO_SSH_KEY="${DO_SSH_KEY:-}"
 REGION="${REGION:-sfo3}"
 SIZE="${SIZE:-s-8vcpu-16gb}"
+CONFIG_FILE="${CONFIG_FILE:-$REPO_ROOT/config.yaml}"
+WG_SUBNET_PREFIX="${WG_SUBNET_PREFIX:-10.99.0}"
 
 export DIGITALOCEAN_ACCESS_TOKEN="$DO_TOKEN"
 IMAGE="ubuntu-24-04-x64"
-GIT_BRANCH=$(git -C "$(dirname "$0")/.." rev-parse --abbrev-ref HEAD)
+GIT_BRANCH="${GIT_BRANCH:-$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)}"
+GIT_COMMIT="${GIT_COMMIT:-$(git -C "$REPO_ROOT" rev-parse --short HEAD)}"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
 
-# ── WireGuard key generation ──────────────────────────────────────────────────
-log "Generating WireGuard keypairs..."
-PRIV0=$(wg genkey);  PUB0=$(echo "$PRIV0" | wg pubkey)
-PRIV1=$(wg genkey);  PUB1=$(echo "$PRIV1" | wg pubkey)
+read_config_stages() {
+    python3 - "$CONFIG_FILE" <<'PY'
+import re
+import sys
+from pathlib import Path
 
-WG0_IP="10.99.0.1"
-WG1_IP="10.99.0.2"
+path = Path(sys.argv[1])
+text = path.read_text()
+match = re.search(r"(?m)^\s*num_stages\s*:\s*(\d+)", text)
+print(match.group(1) if match else "")
+PY
+}
+
+NUM_STAGES="${NUM_STAGES:-$(read_config_stages)}"
+[[ "$NUM_STAGES" =~ ^[0-9]+$ ]] || err "NUM_STAGES must be a number; set NUM_STAGES or fix $CONFIG_FILE"
+(( NUM_STAGES >= 2 )) || err "NUM_STAGES must be at least 2"
+
+declare -a WG_IPS
+for i in $(seq 0 $((NUM_STAGES-1))); do
+    WG_IPS[$i]="${WG_SUBNET_PREFIX}.$((i+1))"
+done
 WG_PORT=51820
 
-ok "Stage 0 pubkey: $PUB0"
-ok "Stage 1 pubkey: $PUB1"
+# ── generate WireGuard keypairs ───────────────────────────────────────────────
+log "Generating WireGuard keypairs for $NUM_STAGES nodes..."
+declare -a PRIV PUB
+for i in $(seq 0 $((NUM_STAGES-1))); do
+    PRIV[$i]=$(wg genkey)
+    PUB[$i]=$(echo "${PRIV[$i]}" | wg pubkey)
+    ok "Stage $i pubkey: ${PUB[$i]}"
+done
 
-# ── resolve SSH key flag ──────────────────────────────────────────────────────
 SSH_FLAG=""
-if [[ -n "$DO_SSH_KEY" ]]; then
-    SSH_FLAG="--ssh-keys $DO_SSH_KEY"
-fi
+[[ -n "$DO_SSH_KEY" ]] && SSH_FLAG="--ssh-keys $DO_SSH_KEY"
 
 # ── cloud-init builder ────────────────────────────────────────────────────────
-# Args: STAGE  MY_WG_IP  MY_WG_PRIV  PEER_WG_IP  PEER_WG_PUB  PEER_PUBLIC_IP_PLACEHOLDER
+# All scripts that need to land in /opt/pipeline are base64-encoded here and
+# decoded on the droplet — this sidesteps heredoc-within-heredoc quoting issues.
 make_cloud_init() {
     local stage="$1"
-    local my_wg_ip="$2"
-    local my_wg_priv="$3"
-    local peer_wg_ip="$4"
-    local peer_wg_pub="$5"
-    # peer public IP is filled in after droplets are created — placeholder token
-    # replaced by sed in a second pass (see below)
-    local peer_pub_ip_token="PEER_PUBLIC_IP"
+    local my_wg_ip="${WG_IPS[$stage]}"
+    local my_priv="${PRIV[$stage]}"
 
-    # Base64-encode start.sh content so "$@" survives the heredoc expansion chain
-    local _start_b64
-    _start_b64=$(printf '#!/bin/bash\ncd /opt/pipeline\nsource .venv/bin/activate\nexec python src/launch.py --stage %s --peer-ip %s %s "$@"\n' \
-        "${stage}" "${WG0_IP}" "${WG1_IP}" | base64)
+    # Build full-mesh WireGuard config with placeholder IPs (patched over SSH later)
+    local wg_conf
+    wg_conf="[Interface]
+PrivateKey = ${my_priv}
+Address = ${my_wg_ip}/24
+ListenPort = ${WG_PORT}"
+    for i in $(seq 0 $((NUM_STAGES-1))); do
+        [[ $i -eq $stage ]] && continue
+        wg_conf+="
+
+[Peer]
+PublicKey = ${PUB[$i]}
+AllowedIPs = ${WG_IPS[$i]}/32
+Endpoint = PEER_PUB_IP_${i}:${WG_PORT}
+PersistentKeepalive = 25"
+    done
+    local wg_b64; wg_b64=$(printf '%s' "$wg_conf" | base64 | tr -d '\n')
+
+    # start.sh: WireGuard IPs are baked in — no discovery needed at runtime
+    local all_wg_ips="${WG_IPS[*]}"
+    local start_b64; start_b64=$(printf '#!/bin/bash\ncd /opt/pipeline\nsource .venv/bin/activate\nexec python src/launch.py --stage %d --peer-ip %s --stages %d "$@"\n' \
+        "$stage" "$all_wg_ips" "$NUM_STAGES" | base64 | tr -d '\n')
+
+    # download_models.sh: stage 0 gets draft + target; all others get target only
+    local dl_script
+    dl_script="#!/bin/bash
+source /opt/pipeline/.venv/bin/activate
+export HF_TOKEN='${HF_TOKEN}'"
+
+    if [[ $stage -eq 0 ]]; then
+        dl_script+="
+echo '[dl] Downloading draft model unsloth/Llama-3.2-1B...'
+python3 -c \"from transformers import AutoModelForCausalLM, AutoTokenizer; AutoTokenizer.from_pretrained('unsloth/Llama-3.2-1B', token='${HF_TOKEN}' or None); AutoModelForCausalLM.from_pretrained('unsloth/Llama-3.2-1B', token='${HF_TOKEN}' or None)\""
+    fi
+    dl_script+="
+echo '[dl] Downloading target model unsloth/Llama-3.2-3B...'
+python3 -c \"from transformers import AutoModelForCausalLM, AutoTokenizer; AutoTokenizer.from_pretrained('unsloth/Llama-3.2-3B', token='${HF_TOKEN}' or None); AutoModelForCausalLM.from_pretrained('unsloth/Llama-3.2-3B', token='${HF_TOKEN}' or None)\"
+echo '[dl] Done.'"
+    local dl_b64; dl_b64=$(printf '%s' "$dl_script" | base64 | tr -d '\n')
 
     cat <<CLOUDINIT
 #!/bin/bash
 set -euo pipefail
 exec > >(tee /var/log/pipeline-init.log) 2>&1
 
-echo "[init] Installing system packages..."
+echo "[init] Stage ${stage}/${NUM_STAGES} — installing packages..."
 apt-get update -qq
 apt-get install -y -qq python3 python3-pip python3-venv git curl wireguard wireguard-tools build-essential
 
-# Write the WireGuard config FIRST (before the slow pip install) so the deploy
-# script's patch step doesn't race the multi-minute torch download. The peer
-# public IP is filled in over SSH once both droplets are up.
-echo "[init] Writing WireGuard config..."
+echo "[init] Writing WireGuard config (peer IPs patched after all droplets are up)..."
 install -d -m 0700 /etc/wireguard
-cat > /etc/wireguard/wg0.conf <<WGCONF
-[Interface]
-PrivateKey = ${my_wg_priv}
-Address = ${my_wg_ip}/24
-ListenPort = ${WG_PORT}
-
-[Peer]
-PublicKey = ${peer_wg_pub}
-AllowedIPs = ${peer_wg_ip}/32
-Endpoint = ${peer_pub_ip_token}:${WG_PORT}
-PersistentKeepalive = 25
-WGCONF
+printf '%s' "${wg_b64}" | base64 -d > /etc/wireguard/wg0.conf
 chmod 0600 /etc/wireguard/wg0.conf
-echo "[init] WireGuard config written (peer IP will be patched after both droplets are up)"
+# Allow WireGuard through ufw if it happens to be active
+ufw allow ${WG_PORT}/udp 2>/dev/null || true
 
 echo "[init] Cloning repo (branch: ${GIT_BRANCH})..."
 git clone --branch "${GIT_BRANCH}" "https://github.com/${GITHUB_REPO}.git" /opt/pipeline
@@ -119,202 +155,193 @@ python3 -m venv /opt/pipeline/.venv
 /opt/pipeline/.venv/bin/pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
 /opt/pipeline/.venv/bin/pip install --quiet -r requirements.txt
 
-# Write start.sh from base64 to preserve "$@" through heredoc expansion
-printf '%s' "${_start_b64}" | base64 -d > /opt/pipeline/start.sh
+echo "[init] Writing helper scripts..."
+printf '%s' "${start_b64}" | base64 -d > /opt/pipeline/start.sh
 chmod +x /opt/pipeline/start.sh
-
-echo "[init] Downloading HuggingFace models (background)..."
-cat > /opt/pipeline/download_models.sh <<DLSH
-#!/bin/bash
-source /opt/pipeline/.venv/bin/activate
-export HF_TOKEN="${HF_TOKEN}"
-echo "[dl] Downloading draft model unsloth/Llama-3.2-1B..."
-python3 -c "from transformers import AutoModelForCausalLM, AutoTokenizer; \
-    AutoTokenizer.from_pretrained('unsloth/Llama-3.2-1B', token='${HF_TOKEN}' or None); \
-    AutoModelForCausalLM.from_pretrained('unsloth/Llama-3.2-1B', token='${HF_TOKEN}' or None)"
-echo "[dl] Downloading target model unsloth/Llama-3.2-3B..."
-python3 -c "from transformers import AutoModelForCausalLM, AutoTokenizer; \
-    AutoTokenizer.from_pretrained('unsloth/Llama-3.2-3B', token='${HF_TOKEN}' or None); \
-    AutoModelForCausalLM.from_pretrained('unsloth/Llama-3.2-3B', token='${HF_TOKEN}' or None)"
-echo "[dl] Done."
-DLSH
+printf '%s' "${dl_b64}" | base64 -d > /opt/pipeline/download_models.sh
 chmod +x /opt/pipeline/download_models.sh
+
+echo "[init] Starting model download in background..."
 nohup /opt/pipeline/download_models.sh > /var/log/pipeline-models.log 2>&1 &
 
-echo "[init] Bootstrap complete. Model download running in background."
-echo "[init] Check progress: tail -f /var/log/pipeline-models.log"
-echo "[init] After WG is up, run: /opt/pipeline/start.sh --prompt 'your prompt'"
+echo "[init] Bootstrap complete. Peer IPs will be patched and WireGuard started shortly."
+echo "[init] Monitor: tail -f /var/log/pipeline-models.log"
 CLOUDINIT
 }
 
-# ── create droplets (in parallel) ─────────────────────────────────────────────
+# ── create all droplets in parallel ──────────────────────────────────────────
 echo ""
-log "Creating both droplets in parallel..."
-INIT0=$(make_cloud_init 0 "$WG0_IP" "$PRIV0" "$WG1_IP" "$PUB1")
-INIT1=$(make_cloud_init 1 "$WG1_IP" "$PRIV1" "$WG0_IP" "$PUB0")
+log "Creating $NUM_STAGES droplets in parallel..."
+declare -a TMPFILES DROPLET_PIDS
+for i in $(seq 0 $((NUM_STAGES-1))); do
+    TMPFILES[$i]=$(mktemp)
+    INIT=$(make_cloud_init $i)
+    doctl compute droplet create "pipeline-stage-${i}" \
+        --image "$IMAGE" --size "$SIZE" --region "$REGION" \
+        $SSH_FLAG --user-data "$INIT" --wait --no-header --format ID \
+        >"${TMPFILES[$i]}" 2>/dev/null &
+    DROPLET_PIDS[$i]=$!
+done
 
-OUT0=$(mktemp); OUT1=$(mktemp)
+for i in $(seq 0 $((NUM_STAGES-1))); do
+    wait "${DROPLET_PIDS[$i]}" || err "Stage $i droplet creation failed"
+done
 
-doctl compute droplet create "pipeline-stage-0" \
-    --image "$IMAGE" --size "$SIZE" --region "$REGION" \
-    $SSH_FLAG --user-data "$INIT0" --wait --no-header --format ID \
-    >"$OUT0" 2>/dev/null &
-PID0=$!
-
-doctl compute droplet create "pipeline-stage-1" \
-    --image "$IMAGE" --size "$SIZE" --region "$REGION" \
-    $SSH_FLAG --user-data "$INIT1" --wait --no-header --format ID \
-    >"$OUT1" 2>/dev/null &
-PID1=$!
-
-wait $PID0 || err "Stage 0 droplet creation failed"
-wait $PID1 || err "Stage 1 droplet creation failed"
-
-DROPLET0_ID=$(tail -1 "$OUT0")
-DROPLET1_ID=$(tail -1 "$OUT1")
-rm -f "$OUT0" "$OUT1"
-
-ok "Stage 0 droplet ID: $DROPLET0_ID"
-ok "Stage 1 droplet ID: $DROPLET1_ID"
+declare -a DROPLET_IDS PUBLIC_IPS
+for i in $(seq 0 $((NUM_STAGES-1))); do
+    DROPLET_IDS[$i]=$(tail -1 "${TMPFILES[$i]}")
+    rm -f "${TMPFILES[$i]}"
+    ok "Stage $i droplet ID: ${DROPLET_IDS[$i]}"
+done
 
 # ── fetch public IPs ──────────────────────────────────────────────────────────
 echo ""
 log "Fetching public IPs..."
-IP0=$(doctl compute droplet get "$DROPLET0_ID" --no-header --format PublicIPv4)
-IP1=$(doctl compute droplet get "$DROPLET1_ID" --no-header --format PublicIPv4)
+for i in $(seq 0 $((NUM_STAGES-1))); do
+    PUBLIC_IPS[$i]=$(doctl compute droplet get "${DROPLET_IDS[$i]}" --no-header --format PublicIPv4)
+    ok "Stage $i  public: ${PUBLIC_IPS[$i]}   WireGuard: ${WG_IPS[$i]}"
+done
 
-ok "Stage 0: $IP0"
-ok "Stage 1: $IP1"
+# ── patch WireGuard on each node ──────────────────────────────────────────────
+# Waits for SSH, then replaces PEER_PUB_IP_N placeholders and enables wg-quick.
 
-# ── patch WireGuard peer IP on each droplet ───────────────────────────────────
-# The cloud-init wrote PEER_PUBLIC_IP as a placeholder — patch it over SSH
-# once both droplets are up. We poll TCP/22 directly (much faster than full
-# ssh attempts) and only spend a real SSH session once the port is open.
-
-# Poll with a real SSH auth probe. On Ubuntu 24.04 the sshd is socket-activated,
-# so a TCP/22 probe returns success the instant the kernel is up — long before
-# cloud-init has written /root/.ssh/authorized_keys or finished apt-get install.
-# A `ssh ... true` round-trip only succeeds once auth and sshd are truly ready.
 wait_for_ssh() {
-    local host="$1"
-    local timeout="${2:-300}"
-    local elapsed=0
+    local host="$1" timeout="${2:-300}" elapsed=0
     while (( elapsed < timeout )); do
-        if ssh $SSH_OPTS -o BatchMode=yes -o ConnectTimeout=8 \
-              root@"$host" true 2>/dev/null; then
-            return 0
-        fi
-        sleep 5
-        elapsed=$((elapsed+5))
+        ssh $SSH_OPTS -o BatchMode=yes -o ConnectTimeout=8 root@"$host" true 2>/dev/null && return 0
+        sleep 5; elapsed=$((elapsed+5))
     done
     return 1
 }
 
-patch_wg() {
-    local host="$1"
-    local peer_ip="$2"
+patch_wg_node() {
+    local idx="$1"
+    local host="${PUBLIC_IPS[$idx]}"
+
     if ! wait_for_ssh "$host" 300; then
-        warn "SSH never came up on $host within 5 min. Patch manually:"
-        echo "    ssh root@$host \"sed -i 's/PEER_PUBLIC_IP/${peer_ip}/' /etc/wireguard/wg0.conf && systemctl enable --now wg-quick@wg0\""
+        warn "SSH never came up on Stage $idx ($host). Patch manually:"
+        local sed_expr=""
+        for i in $(seq 0 $((NUM_STAGES-1))); do
+            [[ $i -eq $idx ]] && continue
+            sed_expr+="s|PEER_PUB_IP_${i}|${PUBLIC_IPS[$i]}|g;"
+        done
+        echo "  ssh root@$host \"sed -i '${sed_expr}' /etc/wireguard/wg0.conf && systemctl enable --now wg-quick@wg0\""
         return 1
     fi
 
-    # cloud-init writes /etc/wireguard/wg0.conf early, but apt-get install of
-    # wireguard-tools can still be in flight when sshd accepts logins. Wait up
-    # to 5 min for the file to appear before trying to sed it.
+    # Wait for wg0.conf to appear (wireguard-tools install may still be running)
     local file_ready=0
-    for i in $(seq 1 60); do
-        if ssh $SSH_OPTS root@"$host" "test -f /etc/wireguard/wg0.conf" 2>/dev/null; then
-            file_ready=1
-            break
-        fi
+    for _ in $(seq 1 60); do
+        ssh $SSH_OPTS root@"$host" "test -f /etc/wireguard/wg0.conf" 2>/dev/null && { file_ready=1; break; }
         sleep 5
     done
-    if (( file_ready == 0 )); then
-        warn "wg0.conf never appeared on $host. cloud-init may have failed; check:"
-        echo "    ssh root@$host 'tail -200 /var/log/pipeline-init.log'"
-        return 1
-    fi
+    (( file_ready )) || { warn "wg0.conf never appeared on Stage $idx"; return 1; }
 
-    local err_log
-    err_log=$(mktemp)
+    # Build sed expression for all peer placeholders
+    local sed_expr=""
+    for i in $(seq 0 $((NUM_STAGES-1))); do
+        [[ $i -eq $idx ]] && continue
+        sed_expr+="s|PEER_PUB_IP_${i}|${PUBLIC_IPS[$i]}|g;"
+    done
+
+    local attempt
     for attempt in 1 2 3; do
         if ssh $SSH_OPTS root@"$host" \
-            "sed -i 's/PEER_PUBLIC_IP/${peer_ip}/' /etc/wireguard/wg0.conf && \
+            "sed -i '${sed_expr}' /etc/wireguard/wg0.conf && \
              systemctl enable wg-quick@wg0 && \
-             (systemctl start wg-quick@wg0 || systemctl restart wg-quick@wg0)" 2>"$err_log"; then
-            ok "WireGuard patched on $host"
-            rm -f "$err_log"
+             (systemctl start wg-quick@wg0 || systemctl restart wg-quick@wg0)" 2>/dev/null; then
+            ok "WireGuard up on Stage $idx ($host)"
             return 0
         fi
-        warn "SSH attempt $attempt/3 to $host failed: $(tr -d '\n' <"$err_log" | head -c 200)"
         sleep 5
     done
-    warn "Could not patch WireGuard on $host after 3 SSH attempts"
-    rm -f "$err_log"
+    warn "Could not start WireGuard on Stage $idx after 3 attempts"
     return 1
 }
 
 echo ""
-log "Waiting for SSH and patching WireGuard on both nodes (in parallel)..."
-patch_wg "$IP0" "$IP1" &
-PATCH_PID0=$!
-patch_wg "$IP1" "$IP0" &
-PATCH_PID1=$!
-wait $PATCH_PID0 $PATCH_PID1
+log "Waiting for SSH and bringing up WireGuard on all nodes (in parallel)..."
+declare -a PATCH_PIDS
+for i in $(seq 0 $((NUM_STAGES-1))); do
+    patch_wg_node $i &
+    PATCH_PIDS[$i]=$!
+done
+for i in $(seq 0 $((NUM_STAGES-1))); do
+    wait "${PATCH_PIDS[$i]}" || warn "WireGuard setup on Stage $i may have failed — check manually"
+done
 
 # ── save deployment state ─────────────────────────────────────────────────────
-cat > "$(dirname "$0")/.deploy-state" <<STATE
-DROPLET0_ID=$DROPLET0_ID
-DROPLET1_ID=$DROPLET1_ID
-IP0=$IP0
-IP1=$IP1
-WG0_IP=$WG0_IP
-WG1_IP=$WG1_IP
-STATE
+STATE_FILE="$DIR/.deploy-state"
+STATE_JSON_FILE="${STATE_JSON_FILE:-$DIR/state.json}"
+{
+    echo "NUM_STAGES=$NUM_STAGES"
+    echo "REGION=$REGION"
+    echo "SIZE=$SIZE"
+    echo "GIT_BRANCH=$GIT_BRANCH"
+    echo "GIT_COMMIT=$GIT_COMMIT"
+    for i in $(seq 0 $((NUM_STAGES-1))); do
+        echo "DROPLET_ID_${i}=${DROPLET_IDS[$i]}"
+        echo "IP${i}=${PUBLIC_IPS[$i]}"
+        echo "WG${i}=${WG_IPS[$i]}"
+    done
+} > "$STATE_FILE"
 
+python3 - "$STATE_FILE" "$STATE_JSON_FILE" <<'PY'
+import json
+import time
+import sys
+from pathlib import Path
+
+legacy = Path(sys.argv[1])
+target = Path(sys.argv[2])
+values = {}
+for line in legacy.read_text().splitlines():
+    if "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    values[key] = value
+
+num_stages = int(values["NUM_STAGES"])
+state = {
+    "schema_version": 1,
+    "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "num_stages": num_stages,
+    "region": values.get("REGION"),
+    "size": values.get("SIZE"),
+    "git_branch": values.get("GIT_BRANCH"),
+    "git_commit": values.get("GIT_COMMIT"),
+    "stages": [
+        {
+            "stage": i,
+            "droplet_id": values.get(f"DROPLET_ID_{i}"),
+            "public_ip": values.get(f"IP{i}"),
+            "wireguard_ip": values.get(f"WG{i}"),
+        }
+        for i in range(num_stages)
+    ],
+}
+target.write_text(json.dumps(state, indent=2) + "\n")
+PY
+
+# ── summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "════════════════════════════════════════════════════════"
-echo "  Deployment complete"
+echo "  Deployment complete  ($NUM_STAGES stages, $SIZE, $REGION)"
+echo "  Repo ref: ${GIT_BRANCH}@${GIT_COMMIT}"
 echo ""
-echo "  Stage 0  public: $IP0   WireGuard: $WG0_IP"
-echo "  Stage 1  public: $IP1   WireGuard: $WG1_IP"
+for i in $(seq 0 $((NUM_STAGES-1))); do
+    printf "  Stage %d  public: %-16s  WireGuard: %s\n" "$i" "${PUBLIC_IPS[$i]}" "${WG_IPS[$i]}"
+done
 echo ""
-echo "  SSH in:"
-echo "    ssh root@$IP0   # stage 0"
-echo "    ssh root@$IP1   # stage 1"
+echo "  SSH in:  ssh root@${PUBLIC_IPS[0]}   (and so on)"
 echo ""
-echo "  Check model download progress:"
-echo "    ssh root@$IP0 tail -f /var/log/pipeline-models.log"
-echo "    ssh root@$IP1 tail -f /var/log/pipeline-models.log"
+echo "  Watch model downloads:"
+for i in $(seq 0 $((NUM_STAGES-1))); do
+    echo "    ssh root@${PUBLIC_IPS[$i]} 'tail -f /var/log/pipeline-models.log'"
+done
 echo ""
-# ── auto-start pipeline ───────────────────────────────────────────────────────
-echo ""
-log "Starting pipeline automatically on both nodes..."
-
-# Stage 1 (must start first, no prompt)
-ssh $SSH_OPTS root@$IP1 \
-  "nohup /opt/pipeline/start.sh > /var/log/pipeline.log 2>&1 &"
-
-# Small delay to ensure stage 1 is listening
-sleep 5
-
-# Stage 0 (entry point with prompt)
-ssh $SSH_OPTS root@$IP0 \
-  "nohup /opt/pipeline/start.sh --prompt 'hello world' > /var/log/pipeline.log 2>&1 &"
-
-ok "Pipeline started on both nodes"
-
-# ── show how to monitor (non-blocking) ────────────────────────────────────────
-echo ""
-echo "════════════════════════════════════════════════════════"
-echo "  Pipeline is running 🚀"
-echo ""
-echo "  View logs anytime:"
-echo "    ssh root@$IP0 'tail -f /var/log/pipeline.log'"
-echo "    ssh root@$IP1 'tail -f /var/log/pipeline.log'"
-echo ""
-echo "  Quick status check:"
-echo "    ssh root@$IP0 'ps aux | grep launch.py'"
-echo "    ssh root@$IP1 'ps aux | grep launch.py'"
+echo "  When models are ready, run the pipeline:"
+echo "    ./deploy/run.sh --prompt 'your prompt here'"
+echo "  Or inspect first:"
+echo "    ./deploy/relayctl.py doctor"
 echo "════════════════════════════════════════════════════════"

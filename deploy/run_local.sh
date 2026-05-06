@@ -10,12 +10,18 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VENV="$REPO_ROOT/venv"
+if [[ -f "$REPO_ROOT/.venv/bin/activate" ]]; then
+    VENV="$REPO_ROOT/.venv"
+elif [[ -f "$REPO_ROOT/venv/bin/activate" ]]; then
+    VENV="$REPO_ROOT/venv"
+else
+    VENV="$REPO_ROOT/.venv"
+fi
 ACTIVATE="$VENV/bin/activate"
 
 if [[ ! -f "$ACTIVATE" ]]; then
     echo "ERROR: venv not found at $VENV"
-    echo "Set one up with: python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt"
+    echo "Set one up with: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt"
     exit 1
 fi
 

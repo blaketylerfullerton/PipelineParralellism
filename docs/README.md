@@ -124,7 +124,15 @@ pip install -r requirements.txt
 
 ## Running It
 
-### Same machine (3 terminals, for testing)
+### Same machine (subprocess smoke test)
+
+```bash
+./deploy/run_local.py --config config.smoke.yaml --prompt "hello from localhost"
+```
+
+This starts every stage on `127.0.0.1`, writes logs under `logs/local-runs/`, and avoids tmux and DigitalOcean entirely.
+
+### Same machine (manual terminals)
 
 ```bash
 # Terminal 2

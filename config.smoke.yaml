@@ -1,0 +1,30 @@
+pipeline:
+  num_stages: 2
+
+model:
+  name: "sshleifer/tiny-gpt2"
+  arch: "gpt2"
+  dtype: "fp32"
+  max_new_tokens: 3
+  temperature: 1.0
+
+network:
+  base_port: 5650
+  workers:
+    - "127.0.0.1"
+    - "127.0.0.1"
+
+compression:
+  mode: "fp32"
+
+speculative:
+  enabled: false
+  k: 1
+  draft_model: "sshleifer/tiny-gpt2"
+
+cascade:
+  enabled: false
+  confidence_threshold: 0.9
+
+dashboard:
+  refresh_rate_hz: 4

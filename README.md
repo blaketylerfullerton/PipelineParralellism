@@ -73,9 +73,13 @@ relay/
 │   ├── utils.py        # ZMQ socket helpers, tensor send/recv, int8 codec
 │   └── dashboard.py    # live Rich terminal display
 ├── deploy/
-│   ├── deploy.sh       # spin up two DO droplets, wire WireGuard, bootstrap Relay
-│   └── teardown.sh     # delete both droplets
-├── config.yaml         # model, pipeline, network, and speculative settings
+│   ├── relayctl.py     # status, doctor checks, logs, provision/run wrappers
+│   ├── deploy.sh       # spin up N DO droplets, wire WireGuard, bootstrap Relay
+│   ├── run.sh          # start an existing deployment in tmux
+│   ├── run_local.py    # local subprocess runner, no tmux or cloud
+│   └── teardown.sh     # delete deployed droplets
+├── config.yaml         # real model, pipeline, network, speculative settings
+├── config.smoke.yaml   # tiny local smoke-test config
 └── requirements.txt
 ```
 
@@ -105,41 +109,65 @@ REGION=sfo3
 ### Deploy
 
 ```bash
-cd deploy
-./deploy.sh
+./deploy/relayctl.py provision
+# or: ./deploy/deploy.sh
 ```
+
+The droplet bootstrap clones the current Git branch from `GITHUB_REPO`. Push the branch before provisioning, or set `GIT_BRANCH=main` in `deploy/.env` when you want to deploy a known remote branch.
 
 This will:
 1. Generate WireGuard keypairs locally
-2. Create two `s-8vcpu-16gb` Ubuntu droplets
+2. Create `pipeline.num_stages` Ubuntu droplets unless `NUM_STAGES` is set
 3. Each droplet clones the repo, creates a venv, and installs dependencies
-4. WireGuard is configured and started on both droplets
+4. WireGuard is configured and started across the full mesh
 5. Model weights are downloaded in the background
-6. A tmux session opens with both droplets side by side (requires tmux)
+6. Runtime state is written to ignored `deploy/.deploy-state` and `deploy/state.json`
+
+Before running the model, check the deployment:
+
+```bash
+./deploy/relayctl.py status
+./deploy/relayctl.py doctor
+./deploy/relayctl.py logs --kind models
+```
 
 ### Run
 
-Once the model download finishes on both droplets (check with `tail -f /var/log/pipeline-models.log`), start Relay. **Stage 1 must start first.**
+Once the model download finishes on all droplets, start Relay:
 
 ```bash
-# tmux pane — Node 1 (Stage 1)
-/opt/pipeline/start.sh
+./deploy/relayctl.py run --prompt "the future of computing is"
+# or: ./deploy/run.sh --prompt "the future of computing is"
+```
 
-# tmux pane — Node 0 (Stage 0)
-/opt/pipeline/start.sh --prompt "the future of computing is"
+`run.sh` starts worker stages first, then starts Stage 0 after a short delay. It builds the tmux layout dynamically from deploy state, so two-stage and four-stage deployments use the same entry point.
+
+To check the remote commands without opening tmux or SSH sessions:
+
+```bash
+./deploy/relayctl.py run --prompt "the future of computing is" --dry-run
 ```
 
 ### Tear down
 
 ```bash
-./deploy/teardown.sh
+./deploy/relayctl.py teardown
+# or: ./deploy/teardown.sh
 ```
 
 ---
 
 ## Local Testing (single machine)
 
-Run both stages on localhost in two terminals:
+Fast smoke test with the tiny GPT-2 config:
+
+```bash
+./deploy/run_local.py --config config.smoke.yaml --prompt "hello from localhost"
+```
+
+This starts all stages as subprocesses on `127.0.0.1`, waits for Stage 0 to finish, and writes per-stage logs under `logs/local-runs/`.
+
+For manual terminal testing, run both stages on localhost:
 
 ```bash
 # Terminal 2 — Stage 1 first

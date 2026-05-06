@@ -249,11 +249,12 @@ Only helps for multi-user serving (agent workflows, API server). Skip for single
 
 CPU-only right now. Becomes relevant if any machine gets a GPU.
 
-### Local development (`run_local.sh`) ✅ DONE
+### Local development (`run_local.py` / `run_local.sh`) ✅ DONE
 
-Added `deploy/run_local.sh` — runs both pipeline stages on a single machine without any cloud deploy. Opens a split tmux session (Stage 1 left, Stage 0 right) connected over `127.0.0.1`. Both stages use the existing venv and pull models from HuggingFace cache. Useful for rapid iteration without waiting on DigitalOcean provisioning.
+Added two local paths that avoid DigitalOcean provisioning. `deploy/run_local.py` is the fast inner-loop runner: it starts all stages as subprocesses on `127.0.0.1`, writes per-stage logs, and works with `config.smoke.yaml` for tiny-model checks. `deploy/run_local.sh` remains the tmux view for interactive real-model runs.
 
 ```bash
+./deploy/run_local.py --config config.smoke.yaml --prompt "your prompt"
 ./deploy/run_local.sh --prompt "your prompt"
 # or manually in two terminals:
 python src/launch.py --stage 1 --peer-ip 127.0.0.1 127.0.0.1
