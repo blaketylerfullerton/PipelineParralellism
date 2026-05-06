@@ -116,6 +116,42 @@ These are upper bounds — they assume bandwidth is the only thing happening. Re
 
 Do this **after** Phase 2.5 speculative pipelining, not before — see the timing-coupling note in 2.5 for why the order matters.
 
+### Mac (Apple Silicon, QNNPACK) — first measurement, May 2026
+
+First swing of the experiment — `torch.ao.quantization.quantize_dynamic` on the Llama stage `layers` ModuleList — landed on `phase1.6-int8-quant`. Both stages pinned to CPU (`RELAY_FORCE_CPU=1`) so bf16 and int8 share the same backend.
+
+| variant | quant | TPS | avg ms/token | result |
+|---|---|---:|---:|---|
+| nospec | bf16 | 4.44 | 225 | CPU-only baseline (MPS path disabled) |
+| nospec | int8 | **0.31** | **3175** | **14× slower** |
+
+Memory side of the experiment worked exactly as the bandwidth model predicted:
+
+```
+Stage 0: int8 dynamic quant on layers — 3.61 GB → 1.58 GB (2.29× smaller)
+Stage 1: int8 dynamic quant on layers — 3.61 GB → 1.58 GB (2.29× smaller)
+```
+
+So the *premise* of Phase 1.6 — fewer bytes streamed per token — is alive. The wall-clock regression is a kernel-availability problem specific to this hardware:
+
+- The torch wheel on Apple Silicon ships QNNPACK as the only supported quant engine (`torch.backends.quantized.supported_engines == ['qnnpack']`).
+- QNNPACK was designed for ARMv8.2-A `sdot`/`udot` int8 dot-product instructions. Apple's M-series doesn't expose those through PyTorch — Apple's matrix path is AMX, which QNNPACK doesn't target.
+- Net effect: int8 dynamic Linear falls back to a reference kernel that is dramatically slower than the bf16 vectorized path.
+
+This is **not** a clean signal for the Path A vs B decision. It is, however, useful evidence that **PyTorch CPU quant quality is hardware-dependent in ways the bandwidth model alone doesn't capture** — which is itself a reason Path B exists. Reserve judgment until the same code path runs on x86 with FBGEMM (DO droplets).
+
+### DO (x86, FBGEMM) — pending
+
+Same matrix to be re-run on the existing 2× DO droplets. Expectations from the table at the top of this section:
+
+- bf16 baseline: ~3.15 TPS (PLAN's measured DO number)
+- int8 prediction: ~1.7 TPS *if bandwidth-bound and FBGEMM kernels are competent*
+
+Decision rule (unchanged from the original Path A/B section):
+- DO int8 ≥ 1.3× DO bf16 → Path A is alive, continue with HF + torch dynamic quant
+- DO int8 ≤ 1.0× DO bf16 → Path B (llama.cpp / GGUF) becomes the credible road
+- DO int8 falls between (1.0×–1.3×) → Path A has thin margin; weigh against engineering cost of Path B
+
 ---
 
 ## Phase 2 — Speculative decoding *(experimental, not default)*

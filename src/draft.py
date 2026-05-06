@@ -47,8 +47,9 @@ def _draft_k_tokens_on_cache(
 class DraftModel:
     """Small local draft model for speculative decoding (runs entirely on Stage 0)."""
 
-    def __init__(self, model_name: str, temperature: float = 1.0, torch_dtype: torch.dtype = torch.float32):
-        self._device = get_device()
+    def __init__(self, model_name: str, temperature: float = 1.0, torch_dtype: torch.dtype = torch.float32,
+                 config: Optional[dict] = None):
+        self._device = get_device(config)
         print(f"  [Draft] Loading {model_name} on {self._device}...")
         self.model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch_dtype)
         self.model = self.model.to(self._device)

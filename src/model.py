@@ -237,13 +237,103 @@ def resolve_dtype(config: dict):
     return _DTYPE_MAP[name]
 
 
+# ============================================================== Quantization
+
+def _stage_param_bytes(module: nn.Module) -> int:
+    total = 0
+    for p in module.parameters():
+        total += p.numel() * p.element_size()
+    for b in module.buffers():
+        total += b.numel() * b.element_size()
+    return total
+
+
+def _ensure_quant_engine() -> str:
+    """Pick a supported torch quantized engine. macOS ARM wheels ship with
+    qnnpack only; Linux x86 wheels typically ship fbgemm. Setting this is a
+    no-op if already configured."""
+    current = torch.backends.quantized.engine
+    if current and current != "none":
+        return current
+    for candidate in ("fbgemm", "qnnpack", "onednn"):
+        if candidate in torch.backends.quantized.supported_engines:
+            torch.backends.quantized.engine = candidate
+            return candidate
+    raise RuntimeError(
+        f"No quantized engine available in this torch build "
+        f"(supported: {torch.backends.quantized.supported_engines})."
+    )
+
+
+def _quantize_module_inplace(parent: nn.Module, attr: str) -> None:
+    """Replace `parent.<attr>` (a ModuleList of transformer layers) with its
+    int8 dynamic-quant version. Conversion requires float32 weights on CPU."""
+    target = getattr(parent, attr)
+    target.to(torch.float32)
+    quantized = torch.ao.quantization.quantize_dynamic(
+        target, {nn.Linear}, dtype=torch.qint8
+    )
+    setattr(parent, attr, quantized)
+
+
+def maybe_quantize_stage(stage: nn.Module, config: dict, stage_id: int) -> nn.Module:
+    """Apply Phase 1.6 weight quantization to the stage's transformer block list.
+
+    Embeddings, RMSNorm/LayerNorm, lm_head, and rotary buffers are intentionally
+    left untouched: they're either tiny or quality-sensitive. Only the per-layer
+    Linear weights (attention QKV/O + MLP gate/up/down) get int8'd, since that's
+    where the bandwidth bill lives.
+    """
+    mode = str(config.get("quantization", {}).get("weight_mode", "bf16")).lower()
+    if mode in ("bf16", "fp16", "fp32"):
+        return stage
+    if mode != "int8":
+        raise ValueError(f"Unknown quantization.weight_mode '{mode}' — use bf16 | int8")
+
+    device = next(stage.parameters()).device
+    if device.type != "cpu":
+        raise RuntimeError(
+            f"Stage {stage_id}: quantization.weight_mode=int8 requires CPU, "
+            f"but stage is on {device.type}. Set model.device: cpu in config "
+            f"or export RELAY_FORCE_CPU=1 — and apply the same setting to bf16 "
+            f"runs so the comparison is apples-to-apples."
+        )
+
+    before = _stage_param_bytes(stage)
+    # Llama stages expose `.layers`; GPT-2 stages expose `.blocks`.
+    target_attr = "layers" if hasattr(stage, "layers") else "blocks" if hasattr(stage, "blocks") else None
+    if target_attr is None:
+        print(f"  Stage {stage_id}: no transformer block list found, skipping quantization.")
+        return stage
+
+    engine = _ensure_quant_engine()
+    print(f"  Stage {stage_id}: using torch quantized engine '{engine}'")
+    _quantize_module_inplace(stage, target_attr)
+
+    # Quantized linears emit/expect float32. Upcast the remaining children
+    # (embed_tokens, rotary_emb, norm, lm_head) so dtypes line up across the
+    # stage — _match_weight_dtype will then pick float32 for incoming hiddens.
+    for name, child in stage.named_children():
+        if name == target_attr:
+            continue
+        child.to(torch.float32)
+
+    after = _stage_param_bytes(stage)
+    ratio = before / max(after, 1)
+    print(f"  Stage {stage_id}: int8 dynamic quant on {target_attr} — "
+          f"{before / 1e9:.2f} GB → {after / 1e9:.2f} GB ({ratio:.2f}× smaller)")
+    return stage
+
+
 # =================================================================== Dispatch
 
 def get_stage(stage_id: int, num_stages: int, config: dict) -> nn.Module:
     arch = config["model"].get("arch", "gpt2").lower()
     if arch == "llama":
-        return _get_stage_llama(stage_id, num_stages, config)
-    return _get_stage_gpt2(stage_id, num_stages, config)
+        stage = _get_stage_llama(stage_id, num_stages, config)
+    else:
+        stage = _get_stage_gpt2(stage_id, num_stages, config)
+    return maybe_quantize_stage(stage, config, stage_id)
 
 
 def _get_stage_gpt2(stage_id: int, num_stages: int, config: dict) -> nn.Module:
@@ -281,7 +371,7 @@ def _get_stage_llama(stage_id: int, num_stages: int, config: dict) -> nn.Module:
     else:
         stage = MiddleLlama(full, s, e)
 
-    device = get_device()
+    device = get_device(config)
     print(f"  Moving stage {stage_id} to {device}...")
     stage = stage.to(device)
 

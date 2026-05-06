@@ -92,16 +92,28 @@ def _parse_stage0_log(path: Path) -> dict:
     return result
 
 
-def _variant_config(base: dict, name: str, *, k: int | None, args: argparse.Namespace, offset: int) -> dict:
+def _variant_config(
+    base: dict,
+    name: str,
+    *,
+    k: int | None,
+    weight_mode: str,
+    args: argparse.Namespace,
+    offset: int,
+) -> dict:
     cfg = copy.deepcopy(base)
     cfg.setdefault("network", {})["base_port"] = int(base["network"].get("base_port", 5550)) + offset
     cfg.setdefault("network", {})["workers"] = ["127.0.0.1"] * int(cfg["pipeline"]["num_stages"])
     if args.max_new_tokens is not None:
         cfg.setdefault("model", {})["max_new_tokens"] = args.max_new_tokens
 
+    cfg.setdefault("quantization", {})["weight_mode"] = weight_mode
+    if args.device != "auto":
+        cfg.setdefault("model", {})["device"] = args.device
+
     spec = cfg.setdefault("speculative", {})
     cascade = cfg.setdefault("cascade", {})
-    if name == "nospec":
+    if name.startswith("nospec"):
         spec["enabled"] = False
         spec["k"] = 1
         spec["pipeline_prefetch"] = False
@@ -115,12 +127,13 @@ def _variant_config(base: dict, name: str, *, k: int | None, args: argparse.Name
 
 
 def _print_table(results: list[dict]) -> None:
-    headers = ["variant", "exit", "tps", "avg_ms", "draft_accept", "out/step", "full", "pipeline"]
+    headers = ["variant", "quant", "exit", "tps", "avg_ms", "draft_accept", "out/step", "full", "pipeline"]
     rows = []
     for item in results:
         parsed = item["parsed"]
         rows.append([
             item["variant"],
+            item.get("weight_mode", ""),
             str(item["exit_code"]),
             "" if parsed.get("tps") is None else f"{parsed['tps']:.2f}",
             "" if parsed.get("avg_ms") is None else f"{parsed['avg_ms']:.1f}",
@@ -152,8 +165,32 @@ def main() -> int:
     parser.add_argument("--prefetch", action="store_true", help="Enable speculative pipeline prefetch variants")
     parser.add_argument("--cascade", action="store_true", help="Enable cascade in spec variants")
     parser.add_argument("--no-nospec", action="store_true", help="Skip the no-spec baseline")
+    parser.add_argument(
+        "--quant",
+        default="bf16",
+        help=(
+            "Comma-separated quantization modes to sweep "
+            "(e.g. 'bf16', 'int8', 'bf16,int8'). Each mode reruns every variant."
+        ),
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "cpu", "mps", "cuda"],
+        help=(
+            "Pin the entire sweep to a specific device. 'auto' picks the best "
+            "available, but is forced to 'cpu' when --quant includes int8 so "
+            "bf16 vs int8 stays apples-to-apples (torch.ao dynamic quant is CPU-only)."
+        ),
+    )
     parser.add_argument("--log-dir", default=None)
     args = parser.parse_args()
+
+    weight_modes_preview = [m.strip() for m in args.quant.split(",") if m.strip()]
+    if args.device == "auto" and "int8" in weight_modes_preview:
+        print("note: --quant includes int8, pinning entire sweep to CPU "
+              "so bf16 and int8 are measured on the same backend.")
+        args.device = "cpu"
 
     base_path = Path(args.base_config).resolve()
     base = _load_config(base_path)
@@ -162,15 +199,26 @@ def main() -> int:
     config_dir = root_log_dir / "configs"
     root_log_dir.mkdir(parents=True, exist_ok=True)
 
-    variants: list[tuple[str, int | None]] = []
+    weight_modes = [m.strip() for m in args.quant.split(",") if m.strip()]
+    if not weight_modes:
+        weight_modes = ["bf16"]
+
+    base_variants: list[tuple[str, int | None]] = []
     if not args.no_nospec:
-        variants.append(("nospec", None))
+        base_variants.append(("nospec", None))
     for k in [int(value.strip()) for value in args.ks.split(",") if value.strip()]:
-        variants.append((f"spec-k{k}", k))
+        base_variants.append((f"spec-k{k}", k))
+
+    # Cross-product: every (variant × quant mode) becomes a labelled run.
+    variants: list[tuple[str, int | None, str]] = []
+    for mode in weight_modes:
+        suffix = "" if len(weight_modes) == 1 and mode == "bf16" else f"-{mode}"
+        for name, k in base_variants:
+            variants.append((f"{name}{suffix}", k, mode))
 
     results = []
-    for idx, (name, k) in enumerate(variants):
-        cfg = _variant_config(base, name, k=k, args=args, offset=idx * 100)
+    for idx, (name, k, weight_mode) in enumerate(variants):
+        cfg = _variant_config(base, name, k=k, weight_mode=weight_mode, args=args, offset=idx * 100)
         config_path = config_dir / f"{name}.yaml"
         variant_log_dir = root_log_dir / name
         _write_config(config_path, cfg)
@@ -193,6 +241,7 @@ def main() -> int:
         parsed = _parse_stage0_log(variant_log_dir / "stage-0.log")
         results.append({
             "variant": name,
+            "weight_mode": weight_mode,
             "config": str(config_path),
             "log_dir": str(variant_log_dir),
             "exit_code": proc.returncode,

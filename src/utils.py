@@ -12,8 +12,21 @@ import zmq
 _SOCKET_BUF = 4 * 1024 * 1024  # 4 MB — reduces latency jitter on WAN
 
 
-def get_device() -> str:
-    """Return the best available compute device: mps > cuda > cpu."""
+def get_device(config: Optional[dict] = None) -> str:
+    """Return the compute device. If config.model.device is set or RELAY_FORCE_CPU=1
+    is in the environment, use that — otherwise auto-pick mps > cuda > cpu.
+
+    The override matters for the Phase 1.6 quantization experiment: torch.ao
+    dynamic quant is CPU-only, so MPS-equipped Macs need to opt out of MPS to
+    actually exercise the int8 path locally.
+    """
+    import os
+    if os.environ.get("RELAY_FORCE_CPU") == "1":
+        return "cpu"
+    if config is not None:
+        forced = str(config.get("model", {}).get("device", "")).lower()
+        if forced in ("cpu", "mps", "cuda"):
+            return forced
     if torch.backends.mps.is_available():
         return "mps"
     if torch.cuda.is_available():

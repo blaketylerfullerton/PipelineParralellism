@@ -118,7 +118,7 @@ def generation_loop(
         if spec_enabled:
             from draft import DraftModel
             draft_model = DraftModel(spec_cfg.get("draft_model", "gpt2"), temperature=temperature,
-                                     torch_dtype=resolve_dtype(config))
+                                     torch_dtype=resolve_dtype(config), config=config)
 
         print(f"\n[Stage 0] Prompt ({input_ids.shape[1]} tokens): \"{prompt}\"")
         print("[Stage 0] Generating: ", end="", flush=True)
