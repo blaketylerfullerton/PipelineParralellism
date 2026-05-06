@@ -5,7 +5,7 @@
 
 > **Research project.** The goal is to decentralize AI compute — running large models cooperatively across ordinary consumer machines connected over the open internet, with no shared memory, no datacenter fabric, and no specialized hardware. This is an attempt to push the limits of what WAN inference can actually do.
 
-Most distributed ML research assumes you have a high-bandwidth, low-latency interconnect (NVLink, InfiniBand, a datacenter LAN). Relay deliberately doesn't. The bet is that with the right combination of pipeline parallelism, speculative decoding, aggressive compression, and smarter local caching, you can make inference across geographically separate commodity machines practical — not just possible.
+Most distributed ML research assumes you have a high-bandwidth, low-latency interconnect (NVLink, InfiniBand, a datacenter LAN). Relay deliberately doesn't. The bet is that with the right combination of pipeline parallelism, KV caching, compression, and fast CPU inference backends, you can make inference across geographically separate commodity machines practical — not just possible.
 
 DigitalOcean droplets over WireGuard stand in for the real target: two people's laptops, a laptop and a spare desktop, a phone and a friend's computer. The cloud VMs are just a reproducible way to develop and benchmark the networking layer before the hardware is in hand.
 
@@ -25,7 +25,7 @@ layers [0 … N/2]                 RMSNorm
                                  LM head
 ```
 
-Stage 0 also runs a smaller **draft model** (Llama 3.2-1B) for speculative decoding. The draft proposes `k` tokens ahead; Stage 1 verifies them in one forward pass. A **cascade** layer adds a local fast-path: if the draft's top-1 probability clears a threshold, Stage 0 accepts the token immediately without sending anything to Stage 1.
+The default path is now the simplest one: KV-cached pipeline-parallel decoding with int8 activation compression over the wire. Speculative decoding, cascade, and prefetch remain in the codebase as experimental modes, but local and DigitalOcean benchmarks both showed that the no-speculative baseline is faster for the current PyTorch CPU backend.
 
 ---
 
@@ -35,13 +35,9 @@ Stage 0 also runs a smaller **draft model** (Llama 3.2-1B) for speculative decod
 ┌──────────────────────────────────────────────────────────┐
 │  Stage 0                                                 │
 │                                                          │
-│  Draft model (Llama 1B) ──► speculate k tokens           │
 │  Target Stage 0 layers   ──► produce hidden states       │
 │                                                          │
-│  Cascade check: if draft confidence ≥ 0.9                │
-│    → accept token locally, skip network round-trip       │
-│                                                          │
-│  Otherwise → compress (int8) & push over WireGuard ──┐  │
+│  Compress hidden states (int8) and push over network ─┐ │
 └──────────────────────────────────────────────────────│──┘
                                                         │
                   WireGuard VPN (10.99.0.0/24)          │
@@ -50,7 +46,7 @@ Stage 0 also runs a smaller **draft model** (Llama 3.2-1B) for speculative decod
 │  Stage 1                                                 │
 │                                                          │
 │  Target Stage 1 layers   ──► logits                      │
-│  Accept/reject draft tokens, sample bonus token          │
+│  Sample next token                                       │
 │  Send result back to Stage 0 ◄──────────────────────    │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -183,6 +179,27 @@ Local benchmark matrix:
 
 By default the matrix disables cascade and prefetch for the speculative variants so `k` is the only moving part. Add `--cascade` or `--prefetch` when you explicitly want those included.
 
+### Current benchmark findings
+
+The latest local matrix on a MacBook Air showed the no-speculative baseline winning:
+
+| variant | TPS | avg ms/token | note |
+|---|---:|---:|---|
+| no-spec | 7.27 | 137.6 | fastest local path |
+| spec k=1 | 6.00 | 166.7 | slower |
+| spec k=2 | 6.53 | 153.2 | best speculative local run, still slower |
+| spec k=4 | 6.18 | 161.7 | slower |
+| spec k=6 | 5.54 | 180.4 | much slower |
+
+DigitalOcean showed the same direction:
+
+| variant | TPS | result |
+|---|---:|---|
+| no-spec | 3.15 | fastest DO path |
+| spec k=2 | 2.77 | ~12% slower |
+
+Conclusion: `config.yaml` defaults to no-speculative decoding. The next useful performance work is quantized weights / a faster CPU backend, not more speculative tuning.
+
 For manual terminal testing, run both stages on localhost:
 
 ```bash
@@ -221,13 +238,13 @@ compression:
   mode: "int8"              # fp32 | fp16 | int8 — applied to hidden states in transit
 
 speculative:
-  enabled: true
-  k: 6                      # draft tokens per step
+  enabled: false            # speculative decoding is experimental; no-spec is the default baseline
+  k: 1                      # ignored when speculative.enabled is false
   draft_model: "unsloth/Llama-3.2-1B"
   pipeline_prefetch: false  # opt-in; usually misses unless the next seed is predictable
 
 cascade:
-  enabled: true
+  enabled: false
   confidence_threshold: 0.9 # accept draft locally if top-1 prob ≥ this
 ```
 
@@ -248,15 +265,19 @@ sudo ufw allow 5550:5560/tcp
 
 ---
 
-## How Speculative Decoding Works Here
+## Experimental Speculative Decoding
 
-Standard autoregressive decoding sends one token at a time through the full pipeline — slow over WAN, because each token is a full network round-trip. Relay uses speculative decoding to draft `k` tokens with the cheap 1B model, then sends them all to Stage 1 at once. Stage 1 runs one forward pass over all `k+1` positions and either accepts each draft token (if the target agrees) or rejects and resamples from that point. On a typical good-confidence step you get 3–5 tokens accepted per round-trip instead of 1.
+Standard autoregressive decoding sends one token at a time through the full pipeline. Relay also has an experimental speculative path: Stage 0 drafts `k` tokens with a 1B model, sends all candidates to Stage 1, and Stage 1 verifies them in one forward pass. Stage 0 accepts the longest valid prefix, rejects when the target disagrees, and samples from the target distribution.
 
-The cascade layer short-circuits even further: if the draft's confidence is high enough (≥ 0.9 top-1 probability), Stage 0 accepts the token locally and buffers the hidden states. These get flushed in a batch on the next network send, so Stage 1 stays in sync without a per-token round-trip.
+This path is useful research scaffolding, but it is not the current default. With the current PyTorch CPU backend, the draft model costs more than it earns back in accepted tokens. The best observed speculative setting was `k=2`, and it still lost to no-spec locally and on DigitalOcean.
 
-End-of-run stats show acceptance rate and cascade hit rate:
+The cascade layer can short-circuit high-confidence draft tokens locally. Speculative prefetch can try to draft the next round during verifier wait time. Both are disabled by default and should be re-enabled only when benchmark data shows a win.
+
+End-of-run stats show draft acceptance, rejection positions, cascade hit rate, and prefetch status:
 
 ```
-[Stage 0] Spec:    avg 3.8 tokens/step  (k=6, acceptance=54%)
+[Stage 0] Spec:     avg 2.42 output tokens/step (k=2, draft_accept=70.8%, full=6/12)
+[Stage 0] Rejects:  pos0=3, pos1=3
 [Stage 0] Cascade: 12/31 steps handled locally (39%)
+[Stage 0] Pipeline: prefetch disabled
 ```

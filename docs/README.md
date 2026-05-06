@@ -2,6 +2,8 @@
 
 A from-scratch implementation of pipeline parallelism for LLM inference across multiple machines. Split GPT-2's layers across two or more computers, send a prompt, and watch each machine process its slice of the model in real time.
 
+> Current state: the project now runs Llama 3.2-3B slices with KV cache and int8 activation compression. Speculative decoding/cascade remain available as experiments, but May 2026 benchmarks showed the no-speculative path winning locally and on DigitalOcean, so `config.yaml` defaults to no-spec.
+
 ---
 
 ## What Is Pipeline Parallelism?
@@ -138,7 +140,17 @@ For a local performance matrix:
 ./deploy/benchmark_matrix.py --base-config config.yaml --prompt "hello from localhost" --ks 1,2,4,6
 ```
 
-Use `config.nospec.yaml` for a direct no-speculative baseline.
+Use `config.nospec.yaml` for a direct no-speculative baseline. The most recent local matrix:
+
+| variant | TPS | avg ms/token |
+|---|---:|---:|
+| no-spec | 7.27 | 137.6 |
+| spec k=1 | 6.00 | 166.7 |
+| spec k=2 | 6.53 | 153.2 |
+| spec k=4 | 6.18 | 161.7 |
+| spec k=6 | 5.54 | 180.4 |
+
+DigitalOcean showed the same conclusion: no-spec reached 3.15 TPS; spec `k=2` reached 2.77 TPS.
 
 ### Same machine (manual terminals)
 
@@ -215,12 +227,16 @@ pipeline:
   num_stages: 2         # how many machines
 
 model:
-  name: "gpt2"          # gpt2 / gpt2-medium / gpt2-large
+  name: "unsloth/Llama-3.2-3B"
+  arch: "llama"
   max_new_tokens: 30    # tokens to generate
   temperature: 1.0      # sampling temperature
 
 network:
   base_port: 5550       # all ports derived from this
+
+speculative:
+  enabled: false        # no-spec is the measured default
 ```
 
 ### Port reference
