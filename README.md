@@ -77,9 +77,11 @@ relay/
 │   ├── deploy.sh       # spin up N DO droplets, wire WireGuard, bootstrap Relay
 │   ├── run.sh          # start an existing deployment in tmux
 │   ├── run_local.py    # local subprocess runner, no tmux or cloud
+│   ├── benchmark_matrix.py # local no-spec / k-value benchmark runner
 │   └── teardown.sh     # delete deployed droplets
 ├── config.yaml         # real model, pipeline, network, speculative settings
 ├── config.smoke.yaml   # tiny local smoke-test config
+├── config.nospec.yaml  # real model without speculative decoding
 └── requirements.txt
 ```
 
@@ -167,6 +169,20 @@ Fast smoke test with the tiny GPT-2 config:
 
 This starts all stages as subprocesses on `127.0.0.1`, waits for Stage 0 to finish, and writes per-stage logs under `logs/local-runs/`.
 
+Baseline without speculative decoding:
+
+```bash
+./deploy/run_local.py --config config.nospec.yaml --prompt "the future of computing is" --timeout 900
+```
+
+Local benchmark matrix:
+
+```bash
+./deploy/benchmark_matrix.py --base-config config.yaml --prompt "the future of computing is" --ks 1,2,4,6 --max-new-tokens 30
+```
+
+By default the matrix disables cascade and prefetch for the speculative variants so `k` is the only moving part. Add `--cascade` or `--prefetch` when you explicitly want those included.
+
 For manual terminal testing, run both stages on localhost:
 
 ```bash
@@ -208,6 +224,7 @@ speculative:
   enabled: true
   k: 6                      # draft tokens per step
   draft_model: "unsloth/Llama-3.2-1B"
+  pipeline_prefetch: false  # opt-in; usually misses unless the next seed is predictable
 
 cascade:
   enabled: true

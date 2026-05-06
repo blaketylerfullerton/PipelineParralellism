@@ -96,7 +96,8 @@ def generation_loop(
     codec = config.get("compression", {}).get("mode", "fp32")
     spec_cfg = config.get("speculative", {})
     spec_enabled = spec_cfg.get("enabled", False)
-    k = spec_cfg.get("k", 4)
+    k = int(spec_cfg.get("k", 4))
+    pipeline_prefetch_enabled = bool(spec_cfg.get("pipeline_prefetch", False))
     dash = get_dashboard()
 
     def _dash_update(**kwargs):
@@ -133,13 +134,18 @@ def generation_loop(
         tokens_generated = 0
         spec_step = 0
         accepted_total = 0
+        draft_accepted_total = 0
+        draft_attempted_total = 0
         spec_steps_total = 0
+        full_accepts = 0
+        reject_positions = [0 for _ in range(k)]
         cascade_hits = 0
         cascade_hidden_buf: list = []  # accumulated Stage-0 hiddens not yet sent to Stage N
 
         # Speculative pipeline prefetch tracking
         pipeline_hits = 0
         pipeline_steps = 0  # spec (non-cascade) steps only
+        prefetch_status_counts = {"hit": 0, "seed_mismatch": 0, "empty": 0, "error": 0, "none": 0}
         _pipeline_assumed_seed: Optional[int] = None  # seed used in last start_prefetch
 
         while tokens_generated < max_new_tokens:
@@ -184,10 +190,11 @@ def generation_loop(
                 # main thread does any model inference, preventing concurrent model use.
                 prefetch_result = None
                 if _pipeline_assumed_seed is not None:
-                    prefetch_result = draft_model.consume_prefetch(
+                    prefetch_result, prefetch_status = draft_model.consume_prefetch(
                         actual_seed_id=last_tok[0, 0].item(),
                         assumed_seed_id=_pipeline_assumed_seed,
                     )
+                    prefetch_status_counts[prefetch_status] = prefetch_status_counts.get(prefetch_status, 0) + 1
                     _pipeline_assumed_seed = None
 
                 # Peek at first draft token (or extract from prefetch).
@@ -269,10 +276,12 @@ def generation_loop(
                     _dash_update(state="forward", current_step=tokens_generated)
                     _publish(sockets["pub"], 0, host, spec_step, "forward", 0, tokens_generated)
 
-                    # Phase 2.5: launch next-round draft in background while we wait.
-                    # Optimistic seed = last draft token (assumes all k accepted, no bonus).
-                    _pipeline_assumed_seed = draft_tokens_t[0, k - 1].item()
-                    draft_model.start_prefetch(draft_tokens_t[:, -1:], k)
+                    if pipeline_prefetch_enabled:
+                        # Phase 2.5: launch next-round draft in background while we wait.
+                        # This is speculative in the literal sense: if target rejects any
+                        # token or emits a bonus token, the next seed will not match.
+                        _pipeline_assumed_seed = draft_tokens_t[0, k - 1].item()
+                        draft_model.start_prefetch(draft_tokens_t[:, -1:], k)
 
                     t_wait_start = time.perf_counter()
                     msg = None
@@ -285,16 +294,26 @@ def generation_loop(
 
                     # Speculative accept/reject (Leviathan et al. 2023, Algorithm 1)
                     accepted = []
+                    draft_accept_count = 0
+                    rejected_at = None
                     for i in range(k):
                         p_i = target_probs[i]
                         q_i = draft_probs_t[i].item()
                         if random.random() <= min(1.0, p_i / (q_i + 1e-9)):
                             accepted.append(draft_tokens_t[0, i].item())
+                            draft_accept_count += 1
                         else:
                             accepted.append(target_samples[i])  # resample from adjusted dist
+                            rejected_at = i
                             break
                     else:
                         accepted.append(target_samples[k])  # bonus token when all k accepted
+                        full_accepts += 1
+
+                    if rejected_at is not None:
+                        reject_positions[rejected_at] += 1
+                    draft_attempted_total += k
+                    draft_accepted_total += draft_accept_count
 
                     # Clip to remaining budget
                     remaining = max_new_tokens - tokens_generated
@@ -321,7 +340,14 @@ def generation_loop(
                     fwd_ms = (t_fwd_end - t_fwd_start) * 1000
                     wait_ms = (t_wait_end - t_wait_start) * 1000
                     pipe_tag = " [PF]" if prefetch_result is not None else ""
-                    print(f"\n[Step {spec_step:3d}] SPEC{pipe_tag}    draft={draft_ms:.0f}ms  fwd={fwd_ms:.0f}ms  wait={wait_ms:.0f}ms  acc={M}/{k}  {per_tok_ms:.0f}ms/tok", flush=True)
+                    reject_tag = "full" if rejected_at is None else f"rej@{rejected_at}"
+                    print(
+                        f"\n[Step {spec_step:3d}] SPEC{pipe_tag}    "
+                        f"draft={draft_ms:.0f}ms  fwd={fwd_ms:.0f}ms  wait={wait_ms:.0f}ms  "
+                        f"draft_acc={draft_accept_count}/{k}  out={M}  {reject_tag}  "
+                        f"{per_tok_ms:.0f}ms/tok",
+                        flush=True,
+                    )
 
                     new_tokens_t = torch.tensor([accepted], dtype=torch.long)
                     generated = torch.cat([generated, new_tokens_t], dim=1)
@@ -359,22 +385,39 @@ def generation_loop(
                      times[-1] if times else 0, tokens_generated)
             spec_step += 1
 
+        if draft_model is not None:
+            draft_model.discard_prefetch()
+
         send_msg(sockets["push"], make_control_msg("end_of_generation"))
 
         avg_ms = sum(times) / max(len(times), 1)
         tps = 1000.0 / avg_ms if avg_ms > 0 else 0
         print(f"\n\n[Stage 0] Done. {tokens_generated} tokens, avg {avg_ms:.1f} ms/token ({tps:.2f} TPS)")
         if spec_enabled and spec_steps_total > 0:
-            avg_acc = accepted_total / spec_steps_total
-            print(f"[Stage 0] Spec:     avg {avg_acc:.2f} tokens/step  "
-                  f"(k={k}, acceptance={avg_acc / (k + 1):.1%})")
+            avg_out = accepted_total / spec_steps_total
+            draft_accept_rate = draft_accepted_total / max(draft_attempted_total, 1)
+            print(f"[Stage 0] Spec:     avg {avg_out:.2f} output tokens/step  "
+                  f"(k={k}, draft_accept={draft_accept_rate:.1%}, full={full_accepts}/{spec_steps_total})")
+            reject_summary = ", ".join(
+                f"pos{i}={count}" for i, count in enumerate(reject_positions) if count
+            )
+            if reject_summary:
+                print(f"[Stage 0] Rejects:  {reject_summary}")
         if cascade_enabled:
             total_steps = cascade_hits + spec_steps_total
             pct = cascade_hits / max(total_steps, 1) * 100
             print(f"[Stage 0] Cascade:  {cascade_hits}/{total_steps} steps handled locally ({pct:.0f}%)")
-        if spec_enabled and pipeline_steps > 0:
-            hit_pct = pipeline_hits / pipeline_steps * 100
-            print(f"[Stage 0] Pipeline: {pipeline_hits}/{pipeline_steps} spec steps used prefetch ({hit_pct:.0f}%)")
+        if spec_enabled:
+            if pipeline_prefetch_enabled and pipeline_steps > 0:
+                hit_pct = pipeline_hits / pipeline_steps * 100
+                miss_summary = ", ".join(
+                    f"{key}={value}" for key, value in prefetch_status_counts.items() if value
+                )
+                print(f"[Stage 0] Pipeline: {pipeline_hits}/{pipeline_steps} spec steps used prefetch ({hit_pct:.0f}%)")
+                if miss_summary:
+                    print(f"[Stage 0] Prefetch: {miss_summary}")
+            else:
+                print("[Stage 0] Pipeline: prefetch disabled")
         _dash_update(state="done", current_step=tokens_generated)
         _publish(sockets["pub"], 0, host, spec_step, "done", avg_ms, tokens_generated)
 

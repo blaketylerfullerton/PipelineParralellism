@@ -1,4 +1,5 @@
 import copy
+import traceback
 import threading
 from typing import Optional, Tuple
 
@@ -60,9 +61,8 @@ class DraftModel:
         self._prefetch_result: Optional[dict] = None
 
     def reset(self):
+        self.discard_prefetch()
         self._kv = None
-        self._prefetch_thread = None
-        self._prefetch_result = None
 
     def init_cache(self, input_ids: torch.Tensor) -> None:
         """Prefill the draft KV cache on a prompt (call once after target prefill)."""
@@ -129,6 +129,8 @@ class DraftModel:
         is expected to be blocked on ZMQ recv while this thread runs, giving
         PyTorch the GIL time it needs.
         """
+        self.discard_prefetch()
+
         # Deep copy so the background thread owns its own KV tensors.
         kv_snapshot = copy.deepcopy(self._kv)
 
@@ -138,36 +140,58 @@ class DraftModel:
         temperature = self.temperature
 
         def _worker() -> None:
-            toks, probs, max_probs, final_kv = _draft_k_tokens_on_cache(
-                model, device, temperature, kv_snapshot, seed_token, k
-            )
-            result["tokens"] = toks
-            result["probs"] = probs
-            result["max_probs"] = max_probs
-            result["kv"] = final_kv
+            try:
+                toks, probs, max_probs, final_kv = _draft_k_tokens_on_cache(
+                    model, device, temperature, kv_snapshot, seed_token, k
+                )
+                result["tokens"] = toks
+                result["probs"] = probs
+                result["max_probs"] = max_probs
+                result["kv"] = final_kv
+            except Exception:
+                result["error"] = traceback.format_exc()
 
         self._prefetch_result = result
-        t = threading.Thread(target=_worker, daemon=True, name="spec_prefetch")
+        t = threading.Thread(target=_worker, name="spec_prefetch")
         t.start()
         self._prefetch_thread = t
 
     def consume_prefetch(
         self, actual_seed_id: int, assumed_seed_id: int
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, DynamicCache]]:
+    ) -> Tuple[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, DynamicCache]], str]:
         """
         Join the prefetch thread and, if the actual seed matches the assumed seed,
         return (tokens (1,k), sampled_probs (k,), max_probs (k,), final_kv).
-        Returns None on mismatch (stale prefetch) or if no prefetch is in flight.
+        Returns (None, reason) on mismatch, error, or if no prefetch is in flight.
 
         Always joins the thread so no concurrent model use can occur after this call.
         The caller is responsible for setting self._kv = final_kv when adopting the result.
         """
         if self._prefetch_thread is None:
-            return None
+            return None, "none"
         self._prefetch_thread.join()
         self._prefetch_thread = None
         result = self._prefetch_result
         self._prefetch_result = None
+        if not result:
+            return None, "empty"
+        if "error" in result:
+            print(f"[Draft] Prefetch failed:\n{result['error']}", flush=True)
+            return None, "error"
         if actual_seed_id != assumed_seed_id:
-            return None
-        return result["tokens"], result["probs"], result["max_probs"], result["kv"]
+            return None, "seed_mismatch"
+        return (result["tokens"], result["probs"], result["max_probs"], result["kv"]), "hit"
+
+    def discard_prefetch(self) -> str:
+        """Join and discard an in-flight prefetch so Python/PyTorch can exit cleanly."""
+        if self._prefetch_thread is None:
+            self._prefetch_result = None
+            return "none"
+        self._prefetch_thread.join()
+        self._prefetch_thread = None
+        result = self._prefetch_result or {}
+        self._prefetch_result = None
+        if "error" in result:
+            print(f"[Draft] Prefetch failed:\n{result['error']}", flush=True)
+            return "error"
+        return "discarded"

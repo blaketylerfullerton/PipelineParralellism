@@ -31,6 +31,11 @@ class ConfigAndCodecTests(unittest.TestCase):
         self.assertEqual(config["pipeline"]["num_stages"], 2)
         self.assertEqual(config["model"]["arch"], "gpt2")
 
+    def test_nospec_config_loads(self):
+        config = load_config(str(ROOT / "config.nospec.yaml"))
+        self.assertFalse(config["speculative"]["enabled"])
+        self.assertFalse(config["cascade"]["enabled"])
+
     def test_port_layout_tracks_stage_count(self):
         config = {
             "pipeline": {"num_stages": 4},

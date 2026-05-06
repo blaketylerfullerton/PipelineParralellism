@@ -22,6 +22,7 @@ speculative:
   enabled: true
   k: 6
   draft_model: "unsloth/Llama-3.2-1B"
+  pipeline_prefetch: false  # opt-in; usually misses unless the next seed is predictable
 
 cascade:
   enabled: true

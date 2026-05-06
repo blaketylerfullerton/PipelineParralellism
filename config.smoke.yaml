@@ -21,6 +21,7 @@ speculative:
   enabled: false
   k: 1
   draft_model: "sshleifer/tiny-gpt2"
+  pipeline_prefetch: false
 
 cascade:
   enabled: false

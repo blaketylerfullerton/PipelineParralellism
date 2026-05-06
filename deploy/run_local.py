@@ -23,6 +23,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _default_python() -> str:
+    for candidate in [ROOT / ".venv" / "bin" / "python", ROOT / "venv" / "bin" / "python"]:
+        if candidate.exists():
+            return str(candidate)
+    return sys.executable
+
+
 def _read_num_stages(config_path: Path) -> int:
     text = config_path.read_text()
     match = re.search(r"(?m)^\s*num_stages\s*:\s*(\d+)", text)
@@ -87,7 +94,7 @@ def main() -> int:
     parser.add_argument("--config", default=str(ROOT / "config.smoke.yaml"))
     parser.add_argument("--stages", type=int, default=None)
     parser.add_argument("--prompt", default="the future of distributed compute is")
-    parser.add_argument("--python", default=sys.executable)
+    parser.add_argument("--python", default=_default_python())
     parser.add_argument("--start-delay", type=float, default=2.0)
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument(

@@ -1,6 +1,6 @@
 # Distributed Inference — Latency Mitigation Plan
 
-Goal: make pipeline parallelism across WAN-connected CPU machines (WireGuard, different ISPs) actually usable. Starting point was the GPT-2 pipeline in this repo — dense, no KV cache, raw-bytes ZMQ, fully sequential round-trip per token. Current state is Llama-3.2-3B with KV cache, int8 wire compression, speculative decoding (k=6, ~77% acceptance), cascade fast-path (~29% local steps), and speculative pipeline prefetch (draft overlapped with verifier wait).
+Goal: make pipeline parallelism across WAN-connected CPU machines (WireGuard, different ISPs) actually usable. Starting point was the GPT-2 pipeline in this repo — dense, no KV cache, raw-bytes ZMQ, fully sequential round-trip per token. Current state is Llama-3.2-3B with KV cache, int8 wire compression, speculative decoding, cascade fast-path, and deploy/local benchmarking tools to separate model behavior from cloud plumbing.
 
 Realistic target after the full stack: **3–8 TPS for a 70B-equivalent model on 2–3 CPU machines across different internets.** Interactive-ish, not snappy. Good enough for agent workflows.
 
@@ -179,8 +179,8 @@ But that's the *average* — on hits it's ~24% per round. So:
 
 ### What we did
 
-- **`draft.py`**: extracted `_draft_k_tokens_on_cache()` as a thread-safe free function that operates on a KV snapshot with no shared instance state. Added `start_prefetch(seed, k)` — deep-copies the current KV cache and launches a daemon thread (`spec_prefetch`) running the free function from the optimistic seed. Added `consume_prefetch(actual_seed_id, assumed_seed_id)` — joins the thread and returns `(tokens, sampled_probs, max_probs, final_kv)` on a seed match, `None` on mismatch. `draft_k_tokens` refactored to call the same free function and now also returns `max_probs` (needed for cascade threshold decisions).
-- **`worker.py`** (Stage 0 spec branch): after `send_msg`, calls `draft_model.start_prefetch(draft_tokens_t[:, -1:], k)` and stores the optimistic seed. At the top of the *next* spec step, calls `consume_prefetch` before any model inference — guaranteeing the thread is joined before the main thread touches the model. On a hit, adopts the prefetch's `(tokens, probs, kv)` and skips drafting entirely. On a miss or cascade step, falls through to the normal drafting path. `pipeline_hits / pipeline_steps` is tracked and printed in the end-of-generation summary as `Pipeline: N/M spec steps used prefetch (X%)`.
+- **`draft.py`**: extracted `_draft_k_tokens_on_cache()` as a thread-safe free function that operates on a KV snapshot with no shared instance state. `start_prefetch(seed, k)` deep-copies the current KV cache and launches a joinable `spec_prefetch` thread; `consume_prefetch(actual_seed_id, assumed_seed_id)` now returns a `(result, status)` pair so misses are visible (`seed_mismatch`, `empty`, `error`, etc.). `discard_prefetch()` joins and clears any in-flight work before process exit.
+- **`worker.py`** (Stage 0 spec branch): speculative prefetch is now opt-in via `speculative.pipeline_prefetch`. Stage 0 prints draft acceptance separately from output tokens, rejection positions, cascade hit rate, and prefetch miss reasons. This matters because a full speculative accept appends a target bonus token, so the old "last draft token" prefetch assumption often cannot match the next actual seed.
 
 ### Tree speculation upgrade (later, ~1–2 weeks)
 
@@ -251,10 +251,12 @@ CPU-only right now. Becomes relevant if any machine gets a GPU.
 
 ### Local development (`run_local.py` / `run_local.sh`) ✅ DONE
 
-Added two local paths that avoid DigitalOcean provisioning. `deploy/run_local.py` is the fast inner-loop runner: it starts all stages as subprocesses on `127.0.0.1`, writes per-stage logs, and works with `config.smoke.yaml` for tiny-model checks. `deploy/run_local.sh` remains the tmux view for interactive real-model runs.
+Added local paths that avoid DigitalOcean provisioning. `deploy/run_local.py` is the fast inner-loop runner: it starts all stages as subprocesses on `127.0.0.1`, writes per-stage logs, and works with `config.smoke.yaml` for tiny-model checks. `deploy/benchmark_matrix.py` generates no-spec and `k`-sweep configs, runs them through the local runner, and prints a throughput table. `deploy/run_local.sh` remains the tmux view for interactive real-model runs.
 
 ```bash
 ./deploy/run_local.py --config config.smoke.yaml --prompt "your prompt"
+./deploy/run_local.py --config config.nospec.yaml --prompt "your prompt" --timeout 900
+./deploy/benchmark_matrix.py --base-config config.yaml --prompt "your prompt" --ks 1,2,4,6
 ./deploy/run_local.sh --prompt "your prompt"
 # or manually in two terminals:
 python src/launch.py --stage 1 --peer-ip 127.0.0.1 127.0.0.1
@@ -283,7 +285,7 @@ python src/launch.py --stage 0 --peer-ip 127.0.0.1 127.0.0.1 --prompt "..."
 | 4.1 Prefill/decode split | 1 week | asymmetric hardware only | — |
 | 4.3 Microbatching / 1F1B | 1–2 weeks | multi-user only | — |
 
-**Current status:** bottleneck is CPU memory bandwidth, not network. Speculative pipelining is done — hit rate and TPS gain TBD from live measurements. Weight quantization (Phase 1.6) is the next big lever. MoE is deferred until Q4 dense is exhausted.
+**Current status:** bottleneck is CPU memory bandwidth, not network. Live runs need a no-spec baseline and `k` sweep before treating speculative gains as real. Speculative prefetch is opt-in while its seed-match rate is validated. Weight quantization (Phase 1.6) is still the next big lever if the benchmark matrix does not show a clean speculative win.
 
 ---
 
@@ -291,7 +293,7 @@ python src/launch.py --stage 0 --peer-ip 127.0.0.1 127.0.0.1 --prompt "..."
 
 - **~~M1 — Phase 1 complete~~** ✅: KV cache + int8 activations on Llama 3.2-3B across two WireGuard droplets.
 - **~~M2 — Speculative decoding working~~** ✅: 77.1% acceptance, 1.10 TPS on 2× s-8vcpu-16gb, Llama 3.2-3B with 1B draft.
-- **~~M3 — Speculative pipelining~~** ✅: draft hidden inside verifier wait. `pipeline_hits` counter live; target ≥20% hit rate on longer prompts.
+- **M3 — Speculative pipelining validation**: prefetch cleanup is safe and miss reasons are logged; only keep it enabled if `pipeline_hits` is non-zero and the benchmark matrix shows a TPS win.
 - **M3.5 — Weight quantization**: int8 dynamic quant in HF (Path A) gets to ≥1.7 TPS, OR triggers move to Path B.
 - **M4 — Q4 dense ceiling**: whichever path wins, measure the absolute ceiling for dense-pipeline-parallel + spec + cascade. This is the number MoE has to beat.
 - **M5 — WAN across different ISPs**: two machines on genuinely different networks (not same-region DO), ≥2 TPS. Real test of the research thesis.

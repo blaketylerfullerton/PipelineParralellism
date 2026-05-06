@@ -132,6 +132,14 @@ pip install -r requirements.txt
 
 This starts every stage on `127.0.0.1`, writes logs under `logs/local-runs/`, and avoids tmux and DigitalOcean entirely.
 
+For a local performance matrix:
+
+```bash
+./deploy/benchmark_matrix.py --base-config config.yaml --prompt "hello from localhost" --ks 1,2,4,6
+```
+
+Use `config.nospec.yaml` for a direct no-speculative baseline.
+
 ### Same machine (manual terminals)
 
 ```bash
