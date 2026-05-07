@@ -402,7 +402,6 @@ Whether that becomes practical depends almost entirely on:
 
 Relay exists to experimentally investigate those limits.
 
-
 <p align="center">
-  Built on cheap hardware, open networks, and stubborn optimism.
+  <b>Built on cheap hardware, open networks, and stubborn optimism ☕</b>
 </p>
