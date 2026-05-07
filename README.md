@@ -401,3 +401,8 @@ Whether that becomes practical depends almost entirely on:
 * and distributed systems design.
 
 Relay exists to experimentally investigate those limits.
+
+
+<p align="center">
+  Built on cheap hardware, open networks, and stubborn optimism.
+</p>
