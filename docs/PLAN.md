@@ -210,31 +210,32 @@ The seed problem can be partially eliminated by drafting a *tree* during the wai
 
 This was the most important strategic call in the project. The Path A int8 dynamic-quant diagnostic ran on 2026-05-07 and produced a clear kill signal on both axes (speed and correctness), so the project is committing to Path B (llama.cpp RPC).
 
-### Path A diagnostic result
+### Path A diagnostic + Path B kernel validation
 
-Llama-3.2-3B, no-spec, 20 tokens, MacBook Air (Apple Silicon, ARM64 / QNNPACK):
+Llama-3.2-3B on MacBook Air (Apple M4, 16 GB, 10 cores). Path A numbers are no-spec / 20 tokens / `worker.py`; Path B numbers are `llama-bench` tg128 (token-generation throughput, 128-token decode):
 
-| variant | TPS | ms/token | output |
-|---|---:|---:|---|
-| bf16 / MPS | 7.74 | 129 | coherent |
-| bf16 / CPU (apples-to-apples baseline) | 3.37 | 297 | coherent |
-| int8 / CPU (Path A — `quantize_dynamic`) | 1.31 | 764 | **gibberish** (CJK chars, Java tokens, mojibake) |
+| backend | precision | TPS | output | speedup vs bf16/CPU |
+|---|---|---:|---|---:|
+| HF / PyTorch CPU | bf16 | 3.37 | coherent | 1.0× *(baseline)* |
+| HF / PyTorch MPS | bf16 | 7.74 | coherent | 2.3× |
+| HF / PyTorch CPU + `torch.ao` int8 (Path A) | int8 dyn | 1.31 | **gibberish** | 0.4× |
+| **llama.cpp CPU (`-ngl 0`)** | **Q4_K_M** | **38.31** | coherent | **11.4×** |
+| **llama.cpp Metal** | **Q4_K_M** | **43.45** | coherent | **12.9×** |
 
-PLAN.md projected ~1.7× speedup from int8. Measured: **0.39× — 2.6× *slower* than the bf16 CPU baseline.** And the output is broken, not merely degraded — the QNNPACK `reduce_range` interaction with Llama's outlier weight distribution corrupts the model.
+Two findings stack:
+- **Path A killed.** PLAN.md projected ~1.7× from int8. Measured 0.39× — 2.6× *slower* than bf16 CPU, and output is broken (QNNPACK `reduce_range` ✕ Llama outlier weights). Even the optimistic FBGEMM (x86) ceiling of 1.7× lands below Path B's floor.
+- **Path B kernel claim wildly underestimated.** PLAN.md projected ~3× from Q4_K_M; measured 11.4× on the same hardware. Even llama.cpp's CPU-only path beats HF's MPS path by ~5×. The 70B target on 2-CPU droplets is now plausible where it wasn't before.
 
-### Why this is decisive
+### Why the decision is overdetermined
 
-1. **Speed:** the kernels are not just mediocre, they're a regression. Even the optimistic FBGEMM (x86) projection of 1.7× sits below llama.cpp's Q4_K_M floor of ~3× — Path A's ceiling is below Path B's floor.
-2. **Correctness:** dynamic quant of Llama 3 without SmoothQuant/GPTQ-style outlier handling is broken on QNNPACK and known to degrade on FBGEMM. Fixing it is a multi-week detour to land somewhere worse than what llama.cpp gives for free.
-3. **Research thesis:** "commodity hardware over the open internet" explicitly includes ARM laptops (M-series Macs, Snapdragon, eventually phones). A path that doesn't survive on ARM cannot anchor that thesis. llama.cpp ships first-class NEON kernels.
+1. **Path A speed:** the kernels are a regression, not a mediocre win. Path A's ceiling is below Path B's floor.
+2. **Path A correctness:** dynamic quant of Llama 3 without SmoothQuant/GPTQ outlier handling is broken on QNNPACK and known to degrade on FBGEMM. Fixing it is a multi-week detour to land somewhere worse than what llama.cpp gives for free.
+3. **Path B already wins by 5× without leaving Apple Silicon.** llama.cpp CPU-only Q4_K_M (38 TPS) beats HF MPS bf16 (7.74 TPS) by ~5× — the original 2-machine pipeline-parallel architecture is moot at this point on a single box. The bottleneck story changes completely.
+4. **Research thesis:** "commodity hardware over the open internet" explicitly includes ARM laptops (M-series Macs, Snapdragon, eventually phones). Path A doesn't survive on ARM; llama.cpp's NEON kernels do.
 
-### Why we skipped FBGEMM (x86) validation
+### Why we skipped FBGEMM (x86) validation for Path A
 
-Normally you'd confirm on FBGEMM before abandoning Path A. We didn't, and that was deliberate:
-
-- Even if FBGEMM hit the optimistic 1.7×, it loses to llama.cpp Q4_K_M's projected 3×.
-- Llama-3 dynamic quant without SmoothQuant/GPTQ degrades quality on FBGEMM too.
-- ARM gibberish is a credibility risk to the commodity-hardware thesis on its own; the x86 number doesn't change the architectural call.
+Normally you'd confirm on FBGEMM before abandoning Path A. Skipped deliberately: even an optimistic FBGEMM 1.7× loses to llama.cpp Q4_K_M; Llama-3 dynamic quant without SmoothQuant/GPTQ degrades on FBGEMM too; the ARM gibberish alone undermines the commodity-hardware thesis. The x86 number can't change the architectural call.
 
 ### Path B — port onto llama.cpp's RPC backend (now the plan)
 
@@ -248,13 +249,36 @@ Trade-off accepted: lose the educational from-scratch story for the kernel layer
 - `src/model.py:_apply_dynamic_quant` — keep wired but stop expecting it to do real work; useful as a reference for the diagnostic.
 - The `quantization.weight_mode` config field — Path B will repurpose it (`bf16 | q4_k_m | q5_k_m | …`).
 
+### API research findings (2026-05-07)
+
+Before sequencing the port, we investigated whether each stage could remain a Python process running a partial-layer forward with hidden states crossing our existing ZMQ codec. Conclusion: that architecture is **not viable** on llama.cpp's public API.
+
+- **No partial-layer forward.** `llama.h` exposes no function to run layers `N..M` and return an intermediate hidden state.
+- **No hidden-state input.** `llama_batch.embd` accepts the embedding-layer output only, not an arbitrary layer-K hidden. `llama_get_embeddings()` returns the final layer; there's no parameter to select a layer.
+- **Eval callback is read-only.** The `cb_eval` graph callback can read intermediate tensors during forward, but cannot start a forward from an injected hidden — half of what we'd need.
+
+So the only options are (a) **patch llama.cpp internals to expose per-layer forward** (commits us to a maintained fork — the thing we wanted to avoid), or (b) **let llama.cpp do pipeline parallelism via its RPC backend** and keep our novel work at the application level above `llama_decode()`. We're going with (b).
+
+The transport seam is unusually clean: `ggml/src/ggml-rpc/transport.h` is **814 bytes** — a small surface to reimplement against ZMQ-over-WireGuard if we end up needing to. `transport.cpp` (~21 KB) is the TCP reference.
+
+### What survives the architecture change
+
+| feature | survives? | how |
+|---|---|---|
+| KV cache | ✅ | llama.cpp's is better-managed than ours |
+| Activation codec | replaced | weights are now Q4 at rest; activations stay fp16 over RPC. Wire compression is no longer load-bearing (RTT was already <2% of round). |
+| Speculative decoding | ✅ | application level above `llama_decode()` — exactly where ours already is |
+| Speculative pipelining | ✅ | `llama_decode()` releases the GIL, so background-thread drafting during the verifier round still works |
+| **Cascade (early exit)** | ⚠️ **regression risk** | requires "decode through stage-0 layers only, advance only those KV slots." llama.cpp's API runs the whole graph or none of it. Cascade is `enabled: false` by default, so non-urgent — but flag it. Three resolutions: (a) abandon cascade, (b) run a small local stage-0-equivalent model for the fast path, (c) patch llama.cpp. Defer until after M4 — at 11× kernel speedup, cascade's value (skipping cheap tokens) shrinks anyway. |
+| Tree speculation | ✅ | application level |
+| MoE (Phase 3) | ✅ | llama.cpp has Mixtral / Qwen-MoE; expert sharding rides the same RPC backend |
+
 ### Path B sequencing — what to do this week
 
-1. Read `examples/rpc/` in llama.cpp. Identify the transport seam — that's where ZMQ-over-WireGuard replaces their TCP.
-2. Decide where the cascade lives. Two viable options:
-   - **(preferred)** Python controller drives llama.cpp RPC workers — cascade / spec / pipelining logic stays in this repo's Python, kernels are llama.cpp. Keeps the novel contribution in code we own.
-   - Patch cascade into llama.cpp directly — faster runtime but turns us into a llama.cpp maintainer.
-3. Prototype on smoke-config size first: wire one llama.cpp RPC worker into the existing `worker.py` dispatch, with fp16 GGUF before touching Q4. Confirm activation transport (the int8 codec, `is_prefill`/`is_cascade` flags) survives the swap before changing precision.
+1. **Read `ggml/src/ggml-rpc/transport.h` end-to-end.** ~800 bytes — full surface in one sitting. Inventory what a ZMQ implementation would need.
+2. **Stand up an unmodified llama.cpp RPC pipeline first** (`rpc-server` on a second WireGuard-connected machine, orchestrator on machine 0, two-machine Q4_K_M Llama-3.2-3B over **stock TCP-over-WG**). Measure TPS. This is the real M3.5 number.
+3. **Defer the ZMQ port until step 2 says it's load-bearing.** If TCP-over-WG already gets you to 3 TPS+ on two droplets, the kernel speedup has bought enough margin that swapping the transport is optional rather than urgent. Reasons to still do it later: integration with existing ZMQ infra, connection migration, multi-stream resilience.
+4. **Cascade decision can wait.** Park behind M4 (Q4 dense ceiling). Re-evaluate then.
 
 ---
 
@@ -328,13 +352,16 @@ python src/launch.py --stage 0 --peer-ip 127.0.0.1 127.0.0.1 --prompt "..."
 | 2.5 Speculative pipelining | done, opt-in | miss reasons logged; disabled by default | TBD |
 | ~~1.6a Path A int8 dynamic quant~~ ❌ | 1 day | 2.6× slower, gibberish output | 1.31 local (killed) |
 | **Path A vs B decision** ✅ | — | committed to Path B 2026-05-07 | — |
-| **1.6b GGUF Q4 via llama.cpp RPC (Path B)** | 1–2 weeks | inherit NEON / AVX-512 kernels | ~2.5–3 TPS proj. |
-| 2.6 Tree speculation | 1–2 weeks | acceptance ~85% effective | ~+25% |
+| ~~Path B kernel claim — local validation~~ ✅ | 1 hr | llama.cpp Q4_K_M tg128 | **38.31 CPU / 43.45 Metal** (11.4×–12.9×) |
+| **M3.5a — single-machine `llama_decode` Q4_K_M smoke** | 1–2 days | confirms wiring before WAN | — |
+| **M3.5b — two-machine RPC over stock TCP-over-WG** | 2–4 days | this is the baseline that decides transport scope | TBD |
+| Decide: ZMQ transport port (`ggml-rpc/transport.{h,cpp}`) | gate | only if M3.5b TPS warrants it | — |
+| 2.6 Tree speculation | 1–2 weeks | acceptance ~85% effective (now app-level) | ~+25% |
 | 3. MoE architecture | 2–4 weeks | only after Q4 dense saturates | TBD |
 | 4.1 Prefill/decode split | 1 week | asymmetric hardware only | — |
 | 4.3 Microbatching / 1F1B | 1–2 weeks | multi-user only | — |
 
-**Current status:** no-spec won both local and DO benchmarks and is the default. Path A (HF int8 dynamic quant) was diagnosed and killed on 2026-05-07 — 2.6× slower than bf16 CPU AND broken output on QNNPACK. The next major lever is the Path B port onto llama.cpp's RPC backend; speculative decoding remains a preserved experiment, not the main road.
+**Current status:** Path A killed 2026-05-07; Path B kernel claim validated locally at 11.4×–12.9× the bf16/CPU baseline (well above the 3× projection). The next concrete step is M3.5b — two-machine RPC over WireGuard with stock TCP — which decides whether ZMQ transport replacement is load-bearing or optional. Speculative decoding now lives at the application level above `llama_decode()` and survives the architecture change; cascade is flagged as a regression risk and parked until M4.
 
 ---
 
@@ -342,9 +369,9 @@ python src/launch.py --stage 0 --peer-ip 127.0.0.1 127.0.0.1 --prompt "..."
 
 - **~~M1 — Phase 1 complete~~** ✅: KV cache + int8 activations on Llama 3.2-3B across two WireGuard droplets.
 - **~~M2 — Baseline benchmark harness~~** ✅: local matrix and DO manual comparisons show no-spec beating spec.
-- **~~M3 — Path A diagnostic~~** ❌→✅ (decision made): HF int8 dynamic quant ran 2026-05-07. Result: 2.6× slower than bf16 CPU on ARM/QNNPACK and produces gibberish output. Path A killed; project committed to Path B (llama.cpp RPC).
-- **M3.5 — Path B smoke**: one llama.cpp RPC worker wired into `worker.py`, fp16 GGUF, single-machine. Confirms activation transport (int8 codec, `is_prefill`, `is_cascade`) survives the swap before precision changes.
-- **M4 — Q4 dense ceiling**: full pipeline on llama.cpp Q4_K_M across two machines. Measure the absolute ceiling for dense pipeline parallelism. This is the number MoE has to beat.
+- **~~M3 — Path A diagnostic~~** ❌→✅ (decision made 2026-05-07): HF int8 dynamic quant ran 2.6× slower than bf16 CPU on ARM/QNNPACK and produced gibberish output. In the same session, llama.cpp Q4_K_M tg128 measured **38.31 TPS CPU / 43.45 TPS Metal** on the same M4 hardware — 11.4× / 12.9× the bf16/CPU baseline, confirming the Path B kernel claim with margin.
+- **M3.5 — Path B smoke (single-machine, then two-machine)**: orchestrator + `llama_decode` against a Q4_K_M GGUF, no RPC. Then `rpc-server` on a second WireGuard-connected machine, **stock TCP**, two-machine Q4_K_M Llama-3.2-3B. Measure TPS. The result decides whether the ZMQ transport port (`ggml/src/ggml-rpc/transport.{h,cpp}`) is load-bearing or optional.
+- **M4 — Q4 dense ceiling**: best two-machine number for dense pipeline parallelism on droplets. The number MoE has to beat.
 - **M5 — WAN across different ISPs**: two machines on genuinely different networks (not same-region DO), ≥2 TPS. Real test of the research thesis.
 - **M6 — Consumer hardware**: laptops / desktops over the public internet, not cloud VMs.
 - **M7 — MoE sharded inference (only if M4 saturates)**: Mixtral 8x7B Q4 or Qwen-MoE across 3 machines, must beat M4's dense number to be worth the engineering cost.
