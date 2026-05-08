@@ -94,7 +94,7 @@ WAN is currently <2% of the round budget. Deferred until ISP-diverse testing (M5
 
 ---
 
-## Phase 1.6 — Weight quantization *(NEW — highest-leverage open item)*
+## Phase 1.6 — Weight quantization *(diagnostic complete — Path A killed)*
 
 **Why this exists:** the original plan only covered *activation* (wire) compression. With the bottleneck now firmly inside RAM-to-CPU bandwidth, **reducing the bytes-per-weight is the single biggest available win.** Llama-3.2-3B at:
 
@@ -104,17 +104,17 @@ WAN is currently <2% of the round budget. Deferred until ISP-diverse testing (M5
 | int8 | 1 | ~1.5 GB | ~1,800 | ~1.7 |
 | Q4_K_M (GGUF) | ~0.5 | ~750 MB | ~1,000 | ~2.3 |
 
-These are upper bounds — they assume bandwidth is the only thing happening. Real numbers depend on whether the kernel implementations are any good at int8/Q4 on CPU. **That kernel quality question is the trigger for the Path A vs Path B decision below.**
+These were upper bounds — they assumed bandwidth was the only thing happening. The Path A diagnostic (2026-05-07) showed real-world int8 numbers nowhere near these projections, and exposed a correctness failure on top. See the Path A vs Path B section below for the kill signal and the resulting commitment to Path B.
 
-### Concrete changes
+### What we tried (Path A diagnostic)
 
-- Try `torch.ao.quantization.quantize_dynamic` int8 dynamic quant on the stage Linear layers first — cheapest experiment, no infra change. If HF Linear int8 CPU kernels are mediocre (likely), the gain will be sub-2× and that's the signal.
-- If torch dynamic quant disappoints: the right move is GGUF quantization, which means leaving HuggingFace altogether (see Path B below).
-- New `quantization.weight_mode` field in `config.yaml`: `bf16 | int8 | q4`.
+- `torch.ao.quantization.quantize_dynamic` on the stage `Linear` layers, wired through a new `quantization.weight_mode: bf16 | int8` field in `config.yaml`. Implementation lives at `src/model.py:_apply_dynamic_quant`.
+- Three bench configs preserved at the repo root (`bench_bf16_mps.yaml`, `bench_bf16_cpu.yaml`, `bench_int8_cpu.yaml`) so the diagnostic is reproducible.
+- See *Path A vs Path B* below for the result table and decision.
 
 ### Sequencing
 
-Do this **after** Phase 2.5 speculative pipelining, not before — see the timing-coupling note in 2.5 for why the order matters.
+Path A is closed. The remaining weight-quant work is Q4_K_M via llama.cpp under Path B; that supersedes the original "after 2.5" sequencing.
 
 ---
 
@@ -206,25 +206,55 @@ The seed problem can be partially eliminated by drafting a *tree* during the wai
 
 ---
 
-## Path A vs Path B — fork in the road
+## Path A vs Path B — DECIDED 2026-05-07: Path B
 
-This decision is the most important strategic call in the project right now. Make it deliberately, ideally after Phase 2.5 lands and before Phase 1.6 weight quantization.
+This was the most important strategic call in the project. The Path A int8 dynamic-quant diagnostic ran on 2026-05-07 and produced a clear kill signal on both axes (speed and correctness), so the project is committing to Path B (llama.cpp RPC).
 
-### Path A — stay HuggingFace, hand-rolled
+### Path A diagnostic result
 
-Implement Phase 1.6 with `torch.ao.quantization` int8 dynamic quant. Accept that HF's CPU Linear kernels are 3–5× slower than llama.cpp's AVX-512 paths. The research narrative stays clean: every component (KV cache, codec, spec decode, cascade, spec pipelining, MoE eventually) is built from scratch and explainable.
+Llama-3.2-3B, no-spec, 20 tokens, MacBook Air (Apple Silicon, ARM64 / QNNPACK):
 
-Trade-off: the absolute numbers will look weak compared to llama.cpp on the same hardware, even with all the cleverness above. Reviewer reaction may be "interesting design, but why is it 3× slower than llama.cpp baseline?"
+| variant | TPS | ms/token | output |
+|---|---:|---:|---|
+| bf16 / MPS | 7.74 | 129 | coherent |
+| bf16 / CPU (apples-to-apples baseline) | 3.37 | 297 | coherent |
+| int8 / CPU (Path A — `quantize_dynamic`) | 1.31 | 764 | **gibberish** (CJK chars, Java tokens, mojibake) |
 
-### Path B — port onto llama.cpp's RPC backend
+PLAN.md projected ~1.7× speedup from int8. Measured: **0.39× — 2.6× *slower* than the bf16 CPU baseline.** And the output is broken, not merely degraded — the QNNPACK `reduce_range` interaction with Llama's outlier weight distribution corrupts the model.
+
+### Why this is decisive
+
+1. **Speed:** the kernels are not just mediocre, they're a regression. Even the optimistic FBGEMM (x86) projection of 1.7× sits below llama.cpp's Q4_K_M floor of ~3× — Path A's ceiling is below Path B's floor.
+2. **Correctness:** dynamic quant of Llama 3 without SmoothQuant/GPTQ-style outlier handling is broken on QNNPACK and known to degrade on FBGEMM. Fixing it is a multi-week detour to land somewhere worse than what llama.cpp gives for free.
+3. **Research thesis:** "commodity hardware over the open internet" explicitly includes ARM laptops (M-series Macs, Snapdragon, eventually phones). A path that doesn't survive on ARM cannot anchor that thesis. llama.cpp ships first-class NEON kernels.
+
+### Why we skipped FBGEMM (x86) validation
+
+Normally you'd confirm on FBGEMM before abandoning Path A. We didn't, and that was deliberate:
+
+- Even if FBGEMM hit the optimistic 1.7×, it loses to llama.cpp Q4_K_M's projected 3×.
+- Llama-3 dynamic quant without SmoothQuant/GPTQ degrades quality on FBGEMM too.
+- ARM gibberish is a credibility risk to the commodity-hardware thesis on its own; the x86 number doesn't change the architectural call.
+
+### Path B — port onto llama.cpp's RPC backend (now the plan)
 
 Fork llama.cpp's RPC server and lift this repo's novel layers (cascade, WAN-tuned speculative pipelining, eventually MoE-WAN routing) on top of it. Inherit GGUF quantization (Q4_K_M, Q5_K_M), AVX-512/NEON kernels, and battle-tested KV cache management for free.
 
-Trade-off: lose the educational from-scratch story for the kernel layer. The novel contributions (architectural — cascade, pipelining, WAN-aware routing) survive intact.
+Trade-off accepted: lose the educational from-scratch story for the kernel layer. The novel contributions (architectural — cascade, pipelining, WAN-aware routing) survive intact, and now run on a backend that doesn't undermine them with a 2.6× kernel regression.
 
-### How to decide
+### What to keep from the Path A work
 
-Run Path A's int8 dynamic quant experiment first (1 day of work). If it gets to ~1.7 TPS as the table predicts, Path A is viable. If the kernels disappoint and it stalls below 1.4 TPS, that's the signal that you've hit the limit of what HF's CPU paths will give you, and Path B becomes the only way to credibly hit M4–M6.
+- `bench_bf16_mps.yaml`, `bench_bf16_cpu.yaml`, `bench_int8_cpu.yaml` — preserved as reproducible evidence of the kill signal.
+- `src/model.py:_apply_dynamic_quant` — keep wired but stop expecting it to do real work; useful as a reference for the diagnostic.
+- The `quantization.weight_mode` config field — Path B will repurpose it (`bf16 | q4_k_m | q5_k_m | …`).
+
+### Path B sequencing — what to do this week
+
+1. Read `examples/rpc/` in llama.cpp. Identify the transport seam — that's where ZMQ-over-WireGuard replaces their TCP.
+2. Decide where the cascade lives. Two viable options:
+   - **(preferred)** Python controller drives llama.cpp RPC workers — cascade / spec / pipelining logic stays in this repo's Python, kernels are llama.cpp. Keeps the novel contribution in code we own.
+   - Patch cascade into llama.cpp directly — faster runtime but turns us into a llama.cpp maintainer.
+3. Prototype on smoke-config size first: wire one llama.cpp RPC worker into the existing `worker.py` dispatch, with fp16 GGUF before touching Q4. Confirm activation transport (the int8 codec, `is_prefill`/`is_cascade` flags) survives the swap before changing precision.
 
 ---
 
@@ -296,15 +326,15 @@ python src/launch.py --stage 0 --peer-ip 127.0.0.1 127.0.0.1 --prompt "..."
 | 2. Speculative decoding | done, experimental | best `k=2` still slower | 6.53 local / 2.77 DO |
 | 4.2 Cascade | done, experimental | disabled by default | TBD |
 | 2.5 Speculative pipelining | done, opt-in | miss reasons logged; disabled by default | TBD |
-| **1.6 Weight quantization (int8)** | 3–5 days | ~2× memory bandwidth | next target |
-| **Path A vs B decision point** | — | choose based on int8 result | — |
-| 1.6b GGUF Q4 (Path B only) | 1–2 weeks | port onto llama.cpp RPC | ~2.5–3 TPS |
+| ~~1.6a Path A int8 dynamic quant~~ ❌ | 1 day | 2.6× slower, gibberish output | 1.31 local (killed) |
+| **Path A vs B decision** ✅ | — | committed to Path B 2026-05-07 | — |
+| **1.6b GGUF Q4 via llama.cpp RPC (Path B)** | 1–2 weeks | inherit NEON / AVX-512 kernels | ~2.5–3 TPS proj. |
 | 2.6 Tree speculation | 1–2 weeks | acceptance ~85% effective | ~+25% |
 | 3. MoE architecture | 2–4 weeks | only after Q4 dense saturates | TBD |
 | 4.1 Prefill/decode split | 1 week | asymmetric hardware only | — |
 | 4.3 Microbatching / 1F1B | 1–2 weeks | multi-user only | — |
 
-**Current status:** no-spec won both local and DO benchmarks, so it is now the default. The next major lever is weight quantization / faster CPU kernels. Speculative decoding is a preserved experiment, not the main road.
+**Current status:** no-spec won both local and DO benchmarks and is the default. Path A (HF int8 dynamic quant) was diagnosed and killed on 2026-05-07 — 2.6× slower than bf16 CPU AND broken output on QNNPACK. The next major lever is the Path B port onto llama.cpp's RPC backend; speculative decoding remains a preserved experiment, not the main road.
 
 ---
 
@@ -312,8 +342,9 @@ python src/launch.py --stage 0 --peer-ip 127.0.0.1 127.0.0.1 --prompt "..."
 
 - **~~M1 — Phase 1 complete~~** ✅: KV cache + int8 activations on Llama 3.2-3B across two WireGuard droplets.
 - **~~M2 — Baseline benchmark harness~~** ✅: local matrix and DO manual comparisons show no-spec beating spec.
-- **M3 — Weight quantization**: int8 dynamic quant in HF (Path A) gets a clear no-spec TPS win, OR triggers move to Path B.
-- **M4 — Q4 dense ceiling**: whichever backend wins, measure the absolute ceiling for dense pipeline parallelism. This is the number MoE has to beat.
+- **~~M3 — Path A diagnostic~~** ❌→✅ (decision made): HF int8 dynamic quant ran 2026-05-07. Result: 2.6× slower than bf16 CPU on ARM/QNNPACK and produces gibberish output. Path A killed; project committed to Path B (llama.cpp RPC).
+- **M3.5 — Path B smoke**: one llama.cpp RPC worker wired into `worker.py`, fp16 GGUF, single-machine. Confirms activation transport (int8 codec, `is_prefill`, `is_cascade`) survives the swap before precision changes.
+- **M4 — Q4 dense ceiling**: full pipeline on llama.cpp Q4_K_M across two machines. Measure the absolute ceiling for dense pipeline parallelism. This is the number MoE has to beat.
 - **M5 — WAN across different ISPs**: two machines on genuinely different networks (not same-region DO), ≥2 TPS. Real test of the research thesis.
 - **M6 — Consumer hardware**: laptops / desktops over the public internet, not cloud VMs.
 - **M7 — MoE sharded inference (only if M4 saturates)**: Mixtral 8x7B Q4 or Qwen-MoE across 3 machines, must beat M4's dense number to be worth the engineering cost.

@@ -9,6 +9,42 @@ from typing import List, Optional, Tuple
 from utils import get_device
 
 
+def _resolve_stage_device(config: dict) -> str:
+    """Pick stage device. int8 dynamic quant forces CPU regardless of override."""
+    quant = config.get("quantization", {}) or {}
+    if str(quant.get("weight_mode", "bf16")).lower() == "int8":
+        return "cpu"
+    override = str(quant.get("device", "auto")).lower()
+    if override in {"cpu", "mps", "cuda"}:
+        return override
+    return get_device()
+
+
+def _apply_dynamic_quant(stage: nn.Module) -> nn.Module:
+    """Apply torch.ao.quantization.quantize_dynamic (int8) to all nn.Linear in `stage`.
+    Source weights must be fp32; we cast in place if the stage was loaded as bf16/fp16."""
+    # quantize_dynamic requires fp32 source weights — cast the whole stage first.
+    for p in stage.parameters():
+        if p.dtype != torch.float32:
+            p.data = p.data.to(torch.float32)
+    for b in stage.buffers():
+        if b.dtype not in (torch.float32, torch.int64, torch.int32, torch.bool):
+            b.data = b.data.to(torch.float32)
+
+    # QNNPACK is the only backend on Apple Silicon; FBGEMM on x86 droplets.
+    supported = torch.backends.quantized.supported_engines
+    if "fbgemm" in supported:
+        torch.backends.quantized.engine = "fbgemm"
+    elif "qnnpack" in supported:
+        torch.backends.quantized.engine = "qnnpack"
+
+    print(f"  Applying int8 dynamic quant (engine={torch.backends.quantized.engine})...")
+    quantized = torch.ao.quantization.quantize_dynamic(
+        stage, {nn.Linear}, dtype=torch.qint8
+    )
+    return quantized
+
+
 # ===================================================================== GPT-2
 
 class Stage0Module(nn.Module):
@@ -281,7 +317,7 @@ def _get_stage_llama(stage_id: int, num_stages: int, config: dict) -> nn.Module:
     else:
         stage = MiddleLlama(full, s, e)
 
-    device = get_device()
+    device = _resolve_stage_device(config)
     print(f"  Moving stage {stage_id} to {device}...")
     stage = stage.to(device)
 
@@ -289,6 +325,12 @@ def _get_stage_llama(stage_id: int, num_stages: int, config: dict) -> nn.Module:
     # parameters still referenced by the stage stay alive via reference counting.
     del full
     gc.collect()
+
+    weight_mode = str(config.get("quantization", {}).get("weight_mode", "bf16")).lower()
+    if weight_mode == "int8":
+        stage = _apply_dynamic_quant(stage)
+        gc.collect()
+
     return stage
 
 
