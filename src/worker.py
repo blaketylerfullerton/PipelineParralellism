@@ -1,6 +1,5 @@
 import argparse
 import os
-import pickle
 import random
 import time
 from typing import Optional
@@ -25,6 +24,7 @@ from utils import (
     make_push_socket,
     make_spec_result_msg,
     recv_msg,
+    serialize_message,
     send_msg,
     tensor_from_activation_msg,
     trim_dynamic_cache,
@@ -79,7 +79,7 @@ def _publish(pub, stage_id: int, host: str, step: int, state: str,
         "total_steps": total_steps,
         "last_token": last_token,
     }
-    pub.send(pickle.dumps(msg), zmq.NOBLOCK)
+    pub.send(serialize_message(msg), zmq.NOBLOCK)
 
 
 def generation_loop(

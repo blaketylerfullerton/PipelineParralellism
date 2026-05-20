@@ -1,4 +1,7 @@
-import pickle
+import base64
+import hashlib
+import hmac
+import json
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -10,6 +13,17 @@ import yaml
 import zmq
 
 _SOCKET_BUF = 4 * 1024 * 1024  # 4 MB — reduces latency jitter on WAN
+_TRANSPORT_AUTH_TOKEN: Optional[bytes] = None
+_WIRE_VERSION = 1
+_ALLOWED_MSG_TYPES = {
+    "activation",
+    "spec_result",
+    "gradient",
+    "trim_cache",
+    "end_of_generation",
+    "telemetry",
+    "cluster_hello",
+}
 
 
 def get_device() -> str:
@@ -28,7 +42,24 @@ def load_config(path: str = "config.yaml") -> dict:
     for key in required:
         if key not in cfg:
             raise ValueError(f"config.yaml missing required section: {key}")
+    if not cfg.get("trust", {}).get("auth_token"):
+        raise ValueError("config.yaml missing required trust.auth_token for peer authentication")
+    configure_transport_security(cfg)
     return cfg
+
+
+def configure_transport_security(config: dict) -> None:
+    """
+    Configure authenticated message envelopes for trusted cooperative peers.
+
+    The runtime transport is intentionally not a generic object channel: messages
+    are JSON documents with bounded binary tensor fields and an HMAC signature
+    when trust.auth_token is present. Deployments should provide a secret token
+    out-of-band through the private cluster/VPN configuration.
+    """
+    global _TRANSPORT_AUTH_TOKEN
+    token = config.get("trust", {}).get("auth_token") or config.get("network", {}).get("auth_token")
+    _TRANSPORT_AUTH_TOKEN = token.encode("utf-8") if token else None
 
 
 def get_forward_port(config: dict, stage_id: int) -> int:
@@ -138,6 +169,69 @@ def tensor_from_activation_msg(msg: dict) -> torch.Tensor:
     return decode_activation(msg)
 
 
+# --- Wire serialization ---
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return {"__bytes__": base64.b64encode(value).decode("ascii")}
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    return value
+
+
+def _from_json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        if set(value.keys()) == {"__bytes__"}:
+            return base64.b64decode(value["__bytes__"])
+        return {k: _from_json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_from_json_safe(v) for v in value]
+    return value
+
+
+def serialize_message(msg: Dict[str, Any]) -> bytes:
+    msg_type = msg.get("msg_type")
+    if msg_type not in _ALLOWED_MSG_TYPES:
+        raise ValueError(f"unsupported runtime message type: {msg_type!r}")
+
+    payload = json.dumps(
+        _json_safe(msg),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    envelope: Dict[str, Any] = {
+        "wire_version": _WIRE_VERSION,
+        "payload": base64.b64encode(payload).decode("ascii"),
+    }
+    if _TRANSPORT_AUTH_TOKEN:
+        envelope["hmac_sha256"] = hmac.new(
+            _TRANSPORT_AUTH_TOKEN,
+            payload,
+            hashlib.sha256,
+        ).hexdigest()
+    return json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def deserialize_message(data: bytes) -> Dict[str, Any]:
+    envelope = json.loads(data.decode("utf-8"))
+    if envelope.get("wire_version") != _WIRE_VERSION:
+        raise ValueError(f"unsupported wire version: {envelope.get('wire_version')!r}")
+    payload = base64.b64decode(envelope["payload"])
+    if _TRANSPORT_AUTH_TOKEN:
+        expected = hmac.new(_TRANSPORT_AUTH_TOKEN, payload, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, envelope.get("hmac_sha256", "")):
+            raise ValueError("runtime message authentication failed")
+    msg = _from_json_safe(json.loads(payload.decode("utf-8")))
+    if msg.get("msg_type") not in _ALLOWED_MSG_TYPES:
+        raise ValueError(f"unsupported runtime message type: {msg.get('msg_type')!r}")
+    return msg
+
+
 # --- Message constructors ---
 
 def trim_dynamic_cache(cache: DynamicCache, keep_len: int) -> None:
@@ -165,7 +259,7 @@ def make_activation_msg(
         "timestamp_sent": time.time(),
         **encoded,
     }
-    return pickle.dumps(msg)
+    return serialize_message(msg)
 
 
 def make_spec_result_msg(step: int, target_probs: list, target_samples: list) -> bytes:
@@ -182,7 +276,7 @@ def make_spec_result_msg(step: int, target_probs: list, target_samples: list) ->
         "target_samples": target_samples,
         "timestamp_sent": time.time(),
     }
-    return pickle.dumps(msg)
+    return serialize_message(msg)
 
 
 def make_gradient_msg(micro_batch_id: int, stage_id: int, tensor: torch.Tensor) -> bytes:
@@ -196,12 +290,12 @@ def make_gradient_msg(micro_batch_id: int, stage_id: int, tensor: torch.Tensor) 
         "dtype": dtype,
         "timestamp_sent": time.time(),
     }
-    return pickle.dumps(msg)
+    return serialize_message(msg)
 
 
 def make_control_msg(msg_type: str, **kwargs) -> bytes:
     msg = {"msg_type": msg_type, "timestamp_sent": time.time(), **kwargs}
-    return pickle.dumps(msg)
+    return serialize_message(msg)
 
 
 # --- Send / Recv ---
@@ -213,5 +307,5 @@ def send_msg(socket: zmq.Socket, msg_bytes: bytes) -> None:
 def recv_msg(socket: zmq.Socket, timeout_ms: int = 5000) -> Optional[Dict[str, Any]]:
     if socket.poll(timeout_ms, zmq.POLLIN):
         data = socket.recv()
-        return pickle.loads(data)
+        return deserialize_message(data)
     return None

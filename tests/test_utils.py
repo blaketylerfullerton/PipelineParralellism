@@ -14,10 +14,13 @@ if torch is not None:
     from utils import (  # noqa: E402
         decode_activation,
         encode_activation,
+        configure_transport_security,
         get_forward_port,
         get_telemetry_port,
         get_token_return_port,
         load_config,
+        make_activation_msg,
+        deserialize_message,
     )
 
 
@@ -51,6 +54,22 @@ class ConfigAndCodecTests(unittest.TestCase):
         decoded = decode_activation(encoded)
         self.assertEqual(tuple(decoded.shape), tuple(tensor.shape))
         self.assertTrue(torch.allclose(decoded, tensor, atol=0.03))
+
+    def test_activation_message_round_trip_uses_safe_json_envelope(self):
+        configure_transport_security({"trust": {"auth_token": "test-token"}})
+        tensor = torch.tensor([[[1.0, 2.0]]])
+        wire = make_activation_msg(7, 0, tensor, is_prefill=True, codec="fp32")
+        msg = deserialize_message(wire)
+        self.assertEqual(msg["msg_type"], "activation")
+        self.assertEqual(msg["micro_batch_id"], 7)
+        self.assertEqual(tuple(decode_activation(msg).shape), (1, 1, 2))
+
+    def test_message_authentication_rejects_tampering(self):
+        configure_transport_security({"trust": {"auth_token": "test-token"}})
+        wire = bytearray(make_activation_msg(7, 0, torch.tensor([[[1.0]]]), codec="fp32"))
+        wire[-3] = ord("A") if wire[-3] != ord("A") else ord("B")
+        with self.assertRaises(Exception):
+            deserialize_message(bytes(wire))
 
 
 if __name__ == "__main__":

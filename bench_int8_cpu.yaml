@@ -16,6 +16,10 @@ network:
     - "127.0.0.1"
     - "127.0.0.1"
 
+trust:
+  cluster_id: "relay-bench-int8-cpu"
+  auth_token: "local-bench-change-me"
+
 compression:
   mode: "int8"
 

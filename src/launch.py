@@ -1,9 +1,10 @@
 """
-Auto-discovery launcher for pipeline parallelism.
+Trusted-peer launcher for WAN pipeline inference.
 
-Each machine runs this script with its stage number. Machines find each other
-via UDP broadcast on the LAN, a live display shows who is online, and the
-pipeline starts automatically once all stages are present.
+Each machine runs this script with its assigned stage number. Production and WAN
+runs should pass an explicit stage-ordered peer list with --peer-ip; UDP
+discovery is retained only as an opt-in lab convenience and its beacons are
+authenticated by the configured cluster token.
 
 Usage:
   Machine A (driver):  python launch.py --stage 0
@@ -35,7 +36,7 @@ from rich.text import Text
 
 import worker as worker_module
 from model import get_stage
-from utils import load_config
+from utils import deserialize_message, load_config, serialize_message
 
 DISCOVERY_PORT = 5599
 PEER_TIMEOUT = 6.0      # seconds before marking a peer as offline
@@ -96,8 +97,10 @@ def get_local_ip() -> str:
 
 class DiscoveryManager:
     """
-    Broadcasts this machine's presence on the LAN and collects peer info.
-    Each worker announces: stage_id, IP address, hostname.
+    Authenticated lab discovery for explicitly trusted stages.
+
+    This is not open peer admission. It only discovers stage assignments from
+    nodes that already share the cluster auth token from config.
     """
 
     def __init__(self, my_stage: int, num_stages: int, my_ip: str, hostname: str):
@@ -139,13 +142,13 @@ class DiscoveryManager:
     def _broadcast_loop(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        msg = json.dumps({
-            "type": "pp_peer",
+        msg = serialize_message({
+            "msg_type": "cluster_hello",
             "stage": self.my_stage,
             "num_stages": self.num_stages,
             "ip": self.my_ip,
             "hostname": self.hostname,
-        }).encode()
+        })
         while self._running:
             # LAN broadcast (same-subnet peers)
             try:
@@ -175,7 +178,7 @@ class DiscoveryManager:
         sock.settimeout(1.0)
         try:
             # SO_REUSEPORT lets multiple processes on the same host each receive
-            # the same UDP broadcast — essential when testing with 2 workers locally.
+            # the same authenticated UDP beacon — useful for local lab testing.
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             sock.bind(("", DISCOVERY_PORT))
         except OSError as e:
@@ -183,9 +186,9 @@ class DiscoveryManager:
             return
         while self._running:
             try:
-                data, _ = sock.recvfrom(512)
-                msg = json.loads(data)
-                if msg.get("type") != "pp_peer":
+                data, _ = sock.recvfrom(4096)
+                msg = deserialize_message(data)
+                if msg.get("msg_type") != "cluster_hello":
                     continue
                 stage = msg["stage"]
                 if 0 <= stage < self.num_stages:
@@ -281,16 +284,21 @@ def _show_static_peers(worker_ips: List[str], my_stage: int, console: Console) -
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Auto-discover peers and run pipeline parallelism"
+        description="Launch a trusted-peer WAN inference stage"
     )
     parser.add_argument("--stage", type=int, required=True, help="This machine's stage (0-indexed)")
     parser.add_argument("--stages", type=int, default=None, help="Total number of stages (overrides config)")
     parser.add_argument(
         "--peer-ip", nargs="+", metavar="IP",
         help=(
-            "Skip auto-discovery and use these IPs directly, listed in stage order. "
+            "Explicit trusted peer IPs, listed in stage order. "
             "Example (2 machines): --peer-ip 172.16.0.162 192.168.1.66"
         ),
+    )
+    parser.add_argument(
+        "--allow-discovery",
+        action="store_true",
+        help="Opt into authenticated UDP lab discovery when --peer-ip is not provided.",
     )
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt (Stage 0 only)")
     parser.add_argument("--config", type=str, default="config.yaml")
@@ -304,7 +312,19 @@ def main() -> None:
     if args.stage >= num_stages:
         raise SystemExit(f"--stage {args.stage} is out of range for {num_stages} stages (0–{num_stages-1})")
 
-    my_ip = get_local_ip()
+    if args.peer_ip:
+        if len(args.peer_ip) != num_stages:
+            raise SystemExit(
+                f"--peer-ip needs exactly {num_stages} IPs (one per stage), got {len(args.peer_ip)}: {args.peer_ip}"
+            )
+        my_ip = args.peer_ip[args.stage]
+    elif args.allow_discovery:
+        my_ip = get_local_ip()
+    else:
+        raise SystemExit(
+            "Trusted-peer mode requires --peer-ip with one IP per stage. "
+            "For local lab discovery only, rerun with --allow-discovery."
+        )
     hostname = socket.gethostname()
 
     console = Console()
@@ -320,10 +340,6 @@ def main() -> None:
 
     # --- Discovery or manual IP phase ---
     if args.peer_ip:
-        if len(args.peer_ip) != num_stages:
-            raise SystemExit(
-                f"--peer-ip needs exactly {num_stages} IPs (one per stage), got {len(args.peer_ip)}: {args.peer_ip}"
-            )
         ips = args.peer_ip
         _show_static_peers(ips, args.stage, console)
     else:

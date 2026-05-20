@@ -1,12 +1,19 @@
-# Pipeline Parallelism
+# Relay Runtime Notes
 
-A from-scratch implementation of pipeline parallelism for LLM inference across multiple machines. Split GPT-2's layers across two or more computers, send a prompt, and watch each machine process its slice of the model in real time.
+Relay is a secure cooperative inference runtime for explicitly trusted stages.
+It splits an LLM into deterministic runtime operations across authenticated
+machines, then studies how scheduling, KV-cache control, speculative decoding,
+and topology-aware routing behave over WAN links.
 
-> Current state: the project now runs Llama 3.2-3B slices with KV cache and int8 activation compression. Speculative decoding/cascade remain available as experiments, but May 2026 benchmarks showed the no-speculative path winning locally and on DigitalOcean, so `config.yaml` defaults to no-spec.
+> Current state: the Python reference path runs Llama 3.2-3B slices with KV cache,
+> int8 activation compression, authenticated message envelopes, speculative
+> decoding, and optional cascade experiments. May 2026 benchmarks showed the
+> no-speculative path winning locally and on DigitalOcean, so `config.yaml`
+> defaults to no-spec.
 
 ---
 
-## What Is Pipeline Parallelism?
+## What Is Cooperative Pipeline Inference?
 
 GPT-2 is a stack of 12 identical **transformer blocks** (layers). Normally one machine runs all 12 in sequence. Pipeline parallelism splits those layers across machines:
 
@@ -18,14 +25,18 @@ Blocks 0-5             Final LayerNorm
                        LM Head (vocab)
 ```
 
-Each machine only ever loads **half the weights**. Neither machine has the full model in memory at once.
+Each trusted stage only loads its assigned weight slice. A stage receives hidden
+states, executes its local forward pass, updates its KV cache, and forwards the
+next hidden state. It does not receive arbitrary code or peer-supplied tasks.
 
 The real reason this matters in production is **model size**. GPT-2 is tiny (117M parameters, ~500MB). But:
 
 - GPT-3: 175B parameters → ~350GB to store in float16
 - GPT-4: estimated 1.8T parameters
 
-No single GPU can hold those. Pipeline parallelism lets you spread layers across many GPUs or machines so the model fits in memory. Each device only holds its slice of layers.
+No single GPU can hold those. Cooperative pipeline inference lets you spread
+layers across trusted machines so the model fits in memory. Each device only
+holds its slice of layers.
 
 ---
 
@@ -79,7 +90,10 @@ Hidden states travel over **ZeroMQ PUSH/PULL sockets**:
 
 For the token return path (Stage 1 → Stage 0), a separate socket pair runs on port 5556.
 
-Tensors are serialized as raw numpy bytes — `tensor.numpy().tobytes()` with shape and dtype stored alongside in a pickle dict. No heavy serialization library, so you can inspect every message clearly in the logs.
+Runtime messages use a constrained JSON envelope with binary tensor fields and an
+HMAC signature from the configured cluster token. Tensors are still stored as raw
+numpy bytes with shape and dtype metadata, but the wire format is not a Python
+object deserialization channel.
 
 ---
 
@@ -88,7 +102,7 @@ Tensors are serialized as raw numpy bytes — `tensor.numpy().tobytes()` with sh
 ```
 PipeLineParralel/
 ├── src/
-│   ├── launch.py       # auto-discovery + pipeline launcher (start here)
+│   ├── launch.py       # trusted-peer launcher
 │   ├── worker.py       # generation loop logic (one instance per machine)
 │   ├── model.py        # splits GPT-2 into stage slices (Stage0Module, LastModule)
 │   ├── utils.py        # ZMQ socket factories + tensor send/recv
@@ -101,7 +115,7 @@ PipeLineParralel/
 
 ```
 src/launch.py
-  └── DiscoveryManager   discovers peers via UDP broadcast
+  └── DiscoveryManager   optional authenticated lab discovery
   └── src/worker.py      runs the generation loop for this stage
        └── src/model.py      loads only this stage's slice of GPT-2
        └── src/utils.py      handles all network communication
@@ -156,29 +170,32 @@ DigitalOcean showed the same conclusion: no-spec reached 3.15 TPS; spec `k=2` re
 
 ```bash
 # Terminal 2
-python src/launch.py --stage 1 --stages 2
+python src/launch.py --stage 1 --stages 2 --peer-ip 127.0.0.1 127.0.0.1
 
 # Terminal 1 (start last — this one asks for the prompt)
-python src/launch.py --stage 0 --stages 2
+python src/launch.py --stage 0 --stages 2 --peer-ip 127.0.0.1 127.0.0.1
 ```
 
-### Two machines on the same network (auto-discovery)
+### Optional lab discovery
 
-Both machines must be on the same subnet for UDP broadcast to work.
+Manual `--peer-ip` is the default for trusted-peer runs. Authenticated UDP
+discovery is retained for lab testing when all stages already share the cluster
+token in config.
 
 ```bash
 # Machine B (server — start first)
-python src/launch.py --stage 1 --stages 2
+python src/launch.py --stage 1 --stages 2 --allow-discovery
 
 # Machine A (driver — start second, will ask for prompt)
-python src/launch.py --stage 0 --stages 2
+python src/launch.py --stage 0 --stages 2 --allow-discovery
 ```
 
-The discovery panel lights up green when each machine comes online.
+The discovery panel lights up green when each authenticated stage comes online.
 
 ### Two machines on different networks (manual IPs)
 
-If the machines are on different subnets or connected via a VPN like Tailscale, use `--peer-ip` to skip auto-discovery and provide IPs directly.
+If the machines are on different subnets or connected via a VPN like Tailscale,
+use `--peer-ip` and provide IPs directly.
 
 Get each machine's IP first:
 ```bash

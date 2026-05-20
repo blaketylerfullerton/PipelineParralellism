@@ -231,7 +231,7 @@ Two findings stack:
 1. **Path A speed:** the kernels are a regression, not a mediocre win. Path A's ceiling is below Path B's floor.
 2. **Path A correctness:** dynamic quant of Llama 3 without SmoothQuant/GPTQ outlier handling is broken on QNNPACK and known to degrade on FBGEMM. Fixing it is a multi-week detour to land somewhere worse than what llama.cpp gives for free.
 3. **Path B already wins by 5× without leaving Apple Silicon.** llama.cpp CPU-only Q4_K_M (38 TPS) beats HF MPS bf16 (7.74 TPS) by ~5× — the original 2-machine pipeline-parallel architecture is moot at this point on a single box. The bottleneck story changes completely.
-4. **Research thesis:** "commodity hardware over the open internet" explicitly includes ARM laptops (M-series Macs, Snapdragon, eventually phones). Path A doesn't survive on ARM; llama.cpp's NEON kernels do.
+4. **Research thesis:** "trusted cooperative hardware over WAN links" explicitly includes ARM laptops (M-series Macs, Snapdragon, eventually phones). Path A doesn't survive on ARM; llama.cpp's NEON kernels do.
 
 ### Why we skipped FBGEMM (x86) validation for Path A
 

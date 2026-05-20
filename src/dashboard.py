@@ -1,5 +1,4 @@
 import argparse
-import pickle
 import threading
 import time
 from dataclasses import dataclass, field
@@ -13,7 +12,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
 
-from utils import get_telemetry_port, load_config, make_sub_socket
+from utils import deserialize_message, get_telemetry_port, load_config, make_sub_socket
 
 
 @dataclass
@@ -157,7 +156,7 @@ class PipelineDashboard:
         while self._running:
             try:
                 data = sock.recv()
-                msg = pickle.loads(data)
+                msg = deserialize_message(data)
                 if msg.get("msg_type") == "telemetry":
                     sid = msg["stage_id"]
                     self.update_stage(

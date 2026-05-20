@@ -15,6 +15,11 @@ network:
     - "127.0.0.1"
     - "127.0.0.1"
 
+trust:
+  cluster_id: "relay-local-dev"
+  # Replace for WAN runs; all trusted peers must share this out-of-band secret.
+  auth_token: "local-dev-change-me"
+
 compression:
   mode: "int8"  # fp32 | fp16 | int8
 

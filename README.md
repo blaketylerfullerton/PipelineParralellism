@@ -1,9 +1,9 @@
 # Relay
 
-> **Pipeline-parallel LLM inference across the open internet** — laptops, residential
-> connections, and low-cost cloud VMs connected by WireGuard. Relay sits on top of
-> [llama.cpp](https://github.com/ggml-org/llama.cpp) and focuses on the coordination
-> problems specific to high-RTT, heterogeneous, multi-ISP deployments.
+> **A WAN-native runtime architecture for cooperative distributed LLM inference
+> across trusted peers.** Relay is a research runtime for authenticated,
+> organization-controlled nodes connected over high-latency and heterogeneous
+> networks.
 
 <p align="center">
   <img src="images/networking1.png" width="300"/>
@@ -18,10 +18,11 @@
 # Thesis
 
 Distributed LLM inference has so far been a datacenter problem: NVLink, InfiniBand,
-low-jitter LAN. Those assumptions don't hold across residential ISPs, behind NATs,
-with asymmetric bandwidth and tens of milliseconds of RTT. Relay is a research
-platform exploring how far pipeline-parallel transformer inference can go on that
-hardware — and the answer is shaped almost entirely by coordination, not kernels.
+low-jitter LAN. Those assumptions do not hold for trusted cooperative peers spread
+across offices, labs, homes, edge sites, and low-cost cloud VMs, where asymmetric
+bandwidth, intermittent availability, and tens or hundreds of milliseconds of RTT
+shape every runtime decision. Relay explores how a secure inference fabric should
+schedule and route deterministic model operations in that environment.
 
 The kernel question is settled. llama.cpp's k-quants and GGML execution graph are
 purpose-built for CPU and Apple Silicon, and a project-level diagnostic
@@ -35,15 +36,17 @@ identical hardware. Relay uses them. The open questions are at the layer above:
 2. **Empirical characterization of LLM inference across real multi-ISP WAN** —
    jitter, packet loss, asymmetric bandwidth, and how each shapes TPS as model
    size and pipeline depth vary. Most prior work runs intra-datacenter or on
-   well-conditioned volunteer grids; this regime is underexplored.
+   carefully controlled research clusters; cooperative WAN inference is still
+   underexplored.
 3. **WAN-aware orchestration policy** — placing stages, tuning speculative
    `k`, and scheduling prefetch when machines have asymmetric compute and uplink
    budgets.
 
-What Relay deliberately is *not*: a from-scratch inference engine, an alternative
-to llama.cpp, or a high-throughput serving system. The kernel work is a solved
-problem; Relay reuses it. The unsolved question is whether the open internet can
-serve as the interconnect at all.
+Relay is not an arbitrary code execution network, from-scratch inference engine,
+alternative to llama.cpp, or high-throughput serving system. The kernel work is a
+solved problem; Relay reuses it. The unsolved question is how to coordinate
+trusted inference stages over WAN links with realistic latency, failures, and
+heterogeneous hardware.
 
 ---
 
@@ -56,9 +59,9 @@ Most distributed inference systems assume:
 * homogeneous hardware
 * tightly coordinated clusters
 
-Relay deliberately does not. The target environment is laptops, desktops, spare
-home servers, low-cost cloud VMs, and eventually heterogeneous consumer hardware
-over the open internet.
+Relay deliberately does not. The target environment is an invite-only cooperative
+cluster: explicitly trusted laptops, desktops, lab servers, edge machines, and
+low-cost cloud VMs joined through an authenticated private network.
 
 The empirical bottleneck has shifted twice during the project, and that movement
 is what defines the current research direction:
@@ -206,40 +209,35 @@ where the verifier wait shrinks and the WAN share of the round grows.
 
 # Architecture
 
-Relay is now structured as an orchestration layer above llama.cpp:
+Relay is structured as a fixed-operation inference runtime. Trusted stages do not
+receive code, scripts, containers, plugins, or user-defined compute tasks. They
+only exchange authenticated runtime messages for activation transport, forward
+execution, KV-cache control, speculative verification, telemetry, and lifecycle
+coordination.
 
 ```text
-┌──────────────────────────────────────────────────┐
-│ Relay orchestrator (Python)                      │
-│   • draft / verifier loop                        │
-│   • speculative pipelining (background draft)    │
-│   • WAN measurement / instrumentation            │
-└──────────────────────┬───────────────────────────┘
-                       │ llama_decode()
-                       ▼
-┌──────────────────────────────────────────────────┐
-│ llama.cpp                                        │
-│   • GGML kernels (NEON / AVX-512 / Metal)        │
-│   • Q4_K_M weights, fp16 activations             │
-│   • KV cache, graph executor                     │
-└──────────────────────┬───────────────────────────┘
-                       │ RPC backend
-                       ▼
-        ┌──────────────┴──────────────┐
-        ▼                             ▼
-   Stage 0 (rpc-server)         Stage N (rpc-server)
-   layers [0..N/2]              layers [N/2..end]
-                       │
-                       │ TCP-over-WireGuard
-                       │ (or ZMQ-over-WireGuard, pending)
-                       ▼
-             real WAN, multi-ISP
+Trusted control plane
+  - explicit stage membership
+  - shared cluster auth token / private network
+  - topology and latency observations
+  - no public peer admission
+
+Runtime data plane
+  Stage 0 ──activation/KV control──▶ Stage 1 ──...──▶ Stage N
+     ▲                                                   │
+     └──────────── speculative result / sampled token ───┘
+
+Allowed operations
+  - tensor transport
+  - stage-local forward pass
+  - KV cache trim/reset
+  - speculative decode verification
+  - pipeline routing and telemetry
 ```
 
-The pipeline split itself is implicit in llama.cpp's tensor placement and graph
-executor — Relay does not reimplement it. Relay's contributions live at the
-top and bottom of this stack: orchestration above `llama_decode()`, and
-optionally a swapped transport at the very bottom.
+The current Python/HuggingFace path remains the reference implementation for
+experiments. The direction is to keep the operation vocabulary fixed while moving
+kernel execution to llama.cpp where it wins on CPU and Apple Silicon.
 
 ---
 
@@ -253,8 +251,8 @@ optionally a swapped transport at the very bottom.
 │   forward through local layers             │
 └──────────────────────┬─────────────────────┘
                        │
-                       │ WireGuard VPN
-                       │ (TCP today, ZMQ optional)
+                       │ authenticated private WAN
+                       │ (WireGuard/Tailscale plus runtime HMAC)
                        ▼
 ┌────────────────────────────────────────────┐
 │ Stage N  (last layers)                    │
@@ -279,9 +277,9 @@ The real target is geographically separate machines, different ISPs, different
 hardware, unreliable consumer networking. Cloud VMs simply make deployment,
 benchmarking, iteration, and instrumentation easier during development.
 
-WireGuard provides the encrypted overlay network. Relay runs on top using
-TCP-over-WireGuard today, with ZMQ as an optional drop-in once measurement shows
-it warrants the work.
+WireGuard or Tailscale provides the encrypted overlay network. Relay adds a
+runtime message-authentication envelope on top so a node must be both reachable
+on the private network and configured with the shared cluster token.
 
 ---
 
@@ -306,6 +304,7 @@ relay/
 │   └── teardown.sh
 │
 ├── docs/
+│   ├── ARCHITECTURE_AUDIT.md
 │   └── PLAN.md           ← living research plan + decisions
 │
 ├── bench_bf16_cpu.yaml   ← reproducible Path A diagnostic configs
@@ -481,8 +480,8 @@ Relay is **not**:
 
 * a from-scratch inference engine — kernel work delegates to llama.cpp
 * a production inference framework
-* a decentralized AI marketplace
-* a blockchain project
+* an open admission peer network
+* a remote code execution framework
 * a high-throughput serving system
 * a replacement for datacenter inference
 
