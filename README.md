@@ -146,6 +146,50 @@ Two findings stack:
 These are the numbers M3.5b (two-machine RPC over stock TCP-over-WireGuard) has
 to beat to justify the pivot.
 
+## Speculative pipelining decision gate
+
+The project now has a concrete kill/confirm gate for the speculative-pipelining
+thesis in [docs/EXPERIMENT_SPECULATIVE_PIPELINING.md](docs/EXPERIMENT_SPECULATIVE_PIPELINING.md).
+Before running the two-machine sweep, run the analytical model with measured
+Q4_K_M timings:
+
+```bash
+./deploy/speculative_pipelining_model.py \
+  --verifier-ms <T_v> \
+  --draft-ms <T_d> \
+  --alpha-by-k 2:<alpha2>,4:<alpha4>,6:<alpha6> \
+  --rtts-ms 0,50,100,200,400
+```
+
+It writes `prediction.csv`, `prediction.svg`, and `decision.json` under
+`logs/speculative-pipelining/model/`. The decision rule is intentionally simple:
+if pipelined spec does not beat no-spec anywhere at realistic latency, drop it
+from the llama.cpp orchestrator plan; if it beats both no-spec and vanilla spec
+by at least 20%, make speculative pipelining the central paper plot; otherwise
+escalate to a larger-model regime.
+
+When empirical runs exist, log one row per run:
+
+```csv
+config,r_ms,seed,tps,draft_accept_pct
+no-spec,0,0,38.1,
+vanilla-spec,0,0,34.7,55.2
+pipelined-spec,0,0,36.9,55.2
+```
+
+Then summarize the sweep:
+
+```bash
+./deploy/speculative_pipelining_analyze.py logs/speculative-pipelining/runs.csv
+```
+
+The analyzer reads the Stage 0 model decision by default and only reports a
+confirmed result when the empirical threshold matches that prediction within
+~2x.
+
+The README should record only the latest `decision.json` outcome, the best RTT
+cell, median TPS with 95% CIs for the three configs, and a link to the run CSV.
+
 ## Earlier per-token speculative results (HF, single machine)
 
 | variant | TPS | avg ms/token |
