@@ -1,289 +1,358 @@
 # Relay
 
-> **A WAN-native runtime architecture for cooperative distributed LLM inference
-> across trusted peers.** Relay is a research runtime for authenticated,
-> organization-controlled nodes connected over high-latency and heterogeneous
-> networks.
+> **A WAN-native runtime architecture for cooperative distributed LLM inference across trusted peers.**
 
-<p align="center">
-  <img src="images/networking1.png" width="300"/>
-</p>
+Relay is a systems research project on distributed inference under non-datacenter conditions. It studies what changes when LLM execution is coordinated across authenticated, organization-controlled machines connected by realistic WAN links: tens to hundreds of milliseconds of RTT, asymmetric bandwidth, heterogeneous CPUs, and intermittent availability.
+
+Relay does **not** attempt to replace inference kernels. It treats kernel execution as a solved substrate and focuses instead on orchestration: stage placement, scheduling, speculative execution, runtime control, and measurement under realistic network constraints.
 
 <p align="center">
   <img src="images/diagram.png" width="700"/>
 </p>
 
----
+## Overview
 
-# Thesis
+Most distributed inference work assumes datacenter conditions: low-jitter fabrics, homogeneous accelerators, and tightly managed clusters. Relay explores a different regime:
 
-Distributed LLM inference has so far been a datacenter problem: NVLink, InfiniBand,
-low-jitter LAN. Those assumptions do not hold for trusted cooperative peers spread
-across offices, labs, homes, edge sites, and low-cost cloud VMs, where asymmetric
-bandwidth, intermittent availability, and tens or hundreds of milliseconds of RTT
-shape every runtime decision. Relay explores how a secure inference fabric should
-schedule and route deterministic model operations in that environment.
+- trusted peers rather than public admission
+- WAN latency rather than rack-scale links
+- heterogeneous hosts rather than uniform accelerators
+- runtime coordination rather than kernel reinvention
 
-The kernel question is settled. llama.cpp's k-quants and GGML execution graph are
-purpose-built for CPU and Apple Silicon, and a project-level diagnostic
-(2026-05-07) confirmed they outperform a hand-rolled HuggingFace path by ~11× on
-identical hardware. Relay uses them. The open questions are at the layer above:
+The project is positioned as **distributed inference infrastructure research**: a runtime architecture and experimental harness for studying cooperative inference across trusted nodes.
 
-1. **Speculative pipelining for high-RTT links** — hiding draft compute inside
-   the verifier round-trip. The value of this technique scales with the WAN's
-   share of the round budget rather than absolute compute cost, so it becomes
-   *more* relevant after kernel acceleration, not less.
-2. **Empirical characterization of LLM inference across real multi-ISP WAN** —
-   jitter, packet loss, asymmetric bandwidth, and how each shapes TPS as model
-   size and pipeline depth vary. Most prior work runs intra-datacenter or on
-   carefully controlled research clusters; cooperative WAN inference is still
-   underexplored.
-3. **WAN-aware orchestration policy** — placing stages, tuning speculative
-   `k`, and scheduling prefetch when machines have asymmetric compute and uplink
-   budgets.
+## Thesis
 
-Relay is not an arbitrary code execution network, from-scratch inference engine,
-alternative to llama.cpp, or high-throughput serving system. The kernel work is a
-solved problem; Relay reuses it. The unsolved question is how to coordinate
-trusted inference stages over WAN links with realistic latency, failures, and
-heterogeneous hardware.
+**Most distributed inference systems assume datacenter conditions. Relay explores what changes when inference is coordinated across trusted peers over realistic WAN links.**
 
----
+The central systems questions are:
 
-# Motivation
+1. How should a runtime place and coordinate inference stages when RTT is material relative to per-token compute?
+2. When do speculative decoding and speculative pipelining become net-positive over WAN links?
+3. How should scheduling adapt to heterogeneous peers with asymmetric compute, memory bandwidth, and uplink capacity?
+4. What failure, queueing, and transport behaviors emerge once inference spans real private WAN paths rather than a single box or LAN?
 
-Most distributed inference systems assume:
+Relay's claim is intentionally narrow: **once kernel efficiency improves enough, WAN coordination becomes the dominant open problem.**
 
-* GPUs connected through high-bandwidth fabrics
-* low-latency datacenter networking
-* homogeneous hardware
-* tightly coordinated clusters
+## Research Position
 
-Relay deliberately does not. The target environment is an invite-only cooperative
-cluster: explicitly trusted laptops, desktops, lab servers, edge machines, and
-low-cost cloud VMs joined through an authenticated private network.
+Relay is:
 
-The empirical bottleneck has shifted twice during the project, and that movement
-is what defines the current research direction:
+- a distributed inference runtime
+- a WAN-aware orchestration layer
+- a systems research project
+- a coordination architecture for trusted-node inference
+- a benchmark harness for cooperative multi-node execution
 
-* **Phase 0 (GPT-2 in PyTorch, ~0.3 TPS)** — per-token compute was so slow that
-  WAN RTT was a rounding error.
-* **Phase 1 (Llama-3.2-3B in HF bf16)** — CPU compute and memory bandwidth still
-  dominated; RTT measured at **< 2% of round time**.
-* **Phase 1.6 (Llama-3.2-3B Q4_K_M via llama.cpp)** — per-token compute drops
-  ~12× and WAN RTT finally becomes a meaningful fraction of the round.
+Relay is not:
 
-The third regime is the one where the research questions get interesting, and
-where Relay is now focused.
+- a decentralized AI marketplace
+- a permissionless peer swarm
+- a crypto or token project
+- a volunteer compute network
+- a remote code execution framework
+- a from-scratch inference kernel project
 
----
+## What Relay Owns
 
-# What's Borrowed, What's Built
+Relay is explicit about the implementation boundary:
 
-Explicit honesty about the layering matters more than usual here, because the
-project's framing changed mid-flight when the kernel question collapsed onto
-llama.cpp.
-
-| Layer | Provider | Notes |
+| Layer | Owner | Role |
 |---|---|---|
-| GGML kernels (NEON / AVX-512 / Metal) | llama.cpp | Reimplementing them produces slower kernels — verified empirically. |
-| Quantization (Q4_K_M, Q5_K_M, etc.) | llama.cpp k-quants | Outlier-aware; both x86 and ARM paths. |
-| KV cache | llama.cpp | Better-managed than the from-scratch version. |
-| Layer-level pipeline parallelism | llama.cpp RPC backend | Splits graph across machines via `--rpc` / `-ts`. |
-| Per-token transport (currently) | llama.cpp's TCP transport | Pluggable seam at `ggml/src/ggml-rpc/transport.{h,cpp}`. |
-| **Speculative pipelining (next-round prefetch)** | **Relay** | Latency-hiding when the verifier round travels over WAN. Not in upstream. |
-| **Multi-ISP WAN benchmark harness** | **Relay** | Reproducible deployments, cross-ISP measurement. |
-| **WAN-aware orchestration policy** | **Relay** | Stage placement, `k` tuning, prefetch scheduling. |
-| **Optional ZMQ-over-WireGuard transport** | **Relay** | Drop-in replacement for `transport.cpp`. Built only if measurement shows it's load-bearing. |
+| Quantized kernels, GGML execution, device-specific low-level optimization | `llama.cpp` | Fast token-generation substrate on CPU and Apple Silicon |
+| KV cache implementation | `llama.cpp` | Stage-local cache management on the active path |
+| RPC-based layer partitioning | `llama.cpp` | Existing mechanism for graph partition and remote stage execution |
+| Trusted control plane | Relay | Membership, topology, orchestration policy, benchmark harness |
+| WAN-aware scheduling | Relay | Stage placement, runtime coordination, speculative policy |
+| Speculative pipelining experiments | Relay | Hiding draft compute inside verifier/network wait |
+| WAN measurement and experimental methodology | Relay | Reproducible experiments across private multi-node deployments |
 
----
+This layering is a strength. Relay does not claim novelty in kernels. Its research surface is **runtime behavior above the kernel layer**.
 
-# Current State
+## Runtime Model
 
-Relay is mid-pivot from a from-scratch HuggingFace pipeline to a llama.cpp-backed
-implementation. Both code paths currently exist in the tree:
+Relay models distributed inference as a **fixed-operation runtime** over authenticated peers. Nodes do not execute arbitrary code received from other peers. They exchange a constrained set of inference-specific operations:
 
-* **HuggingFace path (legacy)** — full pipeline-parallel split across machines
-  with ZMQ activation transport, KV cache, int8 wire codec, speculative
-  decoding, cascade, and speculative pipelining. Captures the bf16 baseline
-  numbers and serves as the empirical foundation for the kernel comparison.
-* **llama.cpp path (in progress)** — orchestration layer above llama.cpp's
-  RPC backend. Per-stage forward and KV management are delegated; Relay
-  handles draft/verifier loop, speculative pipelining, and WAN measurement
-  at the application level above `llama_decode()`.
+- activation transport between stages
+- stage-local forward execution
+- KV-cache reset and trim
+- speculative verification and token return
+- telemetry and topology observations
+- lifecycle and orchestration control
 
-Active work is on the llama.cpp side. The HF path is retained as the reference
-implementation that produced the bf16 baseline.
+That fixed vocabulary is important to the security model and to the research framing: Relay studies cooperative inference, not general-purpose remote execution.
 
----
+## Architecture
 
-# Current Findings
+Relay separates **control-plane responsibilities** from **data-plane execution**.
 
-## Path A diagnostic + Path B kernel validation (Llama-3.2-3B, M4 MacBook Air)
+### Control Plane
 
-| backend | precision | TPS | output | speedup vs bf16/CPU |
+The control plane is responsible for:
+
+- explicit stage membership
+- authenticated peer admission
+- topology description
+- latency and bandwidth observations
+- stage placement and routing policy
+- experiment configuration and reproducibility
+
+In the current repository, this logic appears as checked configuration, deployment scripts, authenticated envelopes, and benchmark harnesses. The long-term direction is a more explicit orchestration layer above `llama.cpp` RPC.
+
+### Data Plane
+
+The data plane is the per-token execution path:
+
+1. Stage 0 performs local decode work and initiates a verifier round.
+2. Intermediate or remote stages execute their assigned graph partition.
+3. The final stage returns logits or sampled-token metadata.
+4. Relay applies runtime logic such as speculative verification, acceptance, cache control, and next-step scheduling.
+
+The data plane is deliberately narrow. Peers exchange activations, token metadata, telemetry, and cache-control signals; they do not receive scripts, plugins, or arbitrary compute tasks.
+
+### Execution Semantics
+
+At a high level, Relay assumes:
+
+- **deterministic stage ownership**: each stage is assigned to a specific trusted node
+- **authenticated membership**: nodes are admitted by configuration and shared trust material, not public discovery
+- **stage-local state**: each node owns its local weights, KV state, and execution timing
+- **orchestrated decode**: Stage 0 coordinates draft/verifier behavior and token advancement
+- **WAN-visible cost model**: RTT, jitter, and asymmetric bandwidth are treated as first-class scheduling inputs
+
+### Control Plane / Data Plane Sketch
+
+```text
+Trusted control plane
+  - explicit membership
+  - shared trust boundary
+  - topology + telemetry
+  - scheduling policy
+
+Runtime data plane
+  Stage 0 ── activations / control ──▶ Stage 1 ── ... ──▶ Stage N
+     ▲                                                       │
+     └──────── verifier result / sampled token / stats ──────┘
+```
+
+### Stage-0-Centric Decode Loop
+
+```text
+prompt/prefix
+   │
+   ▼
+Stage 0
+  - local forward / draft work
+  - optional speculative prefetch
+  - send verifier batch
+   │
+   ▼
+Remote stage(s)
+  - execute assigned partition
+  - update local KV state
+  - return logits / token metadata
+   │
+   ▼
+Stage 0
+  - verify / accept / reject
+  - trim/reset as needed
+  - schedule next round
+```
+
+## Current Implementation State
+
+The repository currently contains two implementation paths:
+
+### 1. Python/HuggingFace Reference Runtime
+
+This is the original reference implementation and remains useful for experimentation:
+
+- model slicing across trusted stages
+- ZMQ-based activation transport
+- authenticated runtime envelopes
+- KV cache experiments
+- speculative decoding and cascade experiments
+- local and cloud benchmark tooling
+
+This path produced the original bf16 baselines and much of the empirical groundwork in the repository.
+
+### 2. `llama.cpp`-Backed Runtime Direction
+
+This is the active architectural direction:
+
+- `llama.cpp` owns kernels, quantization, KV behavior, and RPC stage execution
+- Relay moves up-stack to orchestration and experimentation
+- the research focus shifts from "can we hand-build a fast inference path?" to "what runtime policies matter once kernels are already fast?"
+
+That pivot is evidence-driven rather than cosmetic.
+
+## Current Findings
+
+### Kernel-Layer Conclusion
+
+The repository's most important result so far is that the low-level kernel question largely closed once `llama.cpp` was measured directly.
+
+#### Path A diagnostic + Path B kernel validation
+
+Llama-3.2-3B on an M4 MacBook Air:
+
+| backend | precision | TPS | output | speedup vs HF CPU bf16 |
 |---|---|---:|---|---:|
-| HF / PyTorch CPU | bf16 | 3.37 | coherent | 1.0× *(baseline)* |
-| HF / PyTorch MPS | bf16 | 7.74 | coherent | 2.3× |
-| HF / PyTorch CPU + `torch.ao` int8 | int8 dyn | 1.31 | **gibberish** | 0.4× |
-| **llama.cpp CPU (`-ngl 0`)** | **Q4_K_M** | **38.31** | coherent | **11.4×** |
-| **llama.cpp Metal** | **Q4_K_M** | **43.45** | coherent | **12.9×** |
+| HF / PyTorch CPU | bf16 | 3.37 | coherent | 1.0x |
+| HF / PyTorch MPS | bf16 | 7.74 | coherent | 2.3x |
+| HF / PyTorch CPU + `torch.ao` int8 | int8 dyn | 1.31 | gibberish | 0.4x |
+| `llama.cpp` CPU (`-ngl 0`) | Q4_K_M | 38.31 | coherent | 11.4x |
+| `llama.cpp` Metal | Q4_K_M | 43.45 | coherent | 12.9x |
 
-Two findings stack:
+Interpretation:
 
-* Hand-rolled HF int8 dynamic quant produces a 2.6× *slowdown* AND broken output
-  on QNNPACK (the `reduce_range` interaction with Llama's outlier weight
-  distribution). Even the optimistic FBGEMM (x86) projection of 1.7× sits below
-  llama.cpp Q4_K_M's floor. **Path A killed.**
-* llama.cpp Q4_K_M kernels are ~11× faster than HF bf16 on the same hardware.
-  Even llama.cpp's CPU-only path beats HF's MPS path by ~5×. **Kernel question
-  closed; WAN question reopens.**
+- hand-rolled dynamic int8 on the HF path was both slower and lower-quality
+- `llama.cpp` Q4_K_M removed most of the per-token compute bottleneck on the same hardware
+- once compute shrinks by roughly an order of magnitude, WAN coordination becomes the more interesting systems question
 
-## HF baseline across two DigitalOcean droplets (May 2026)
+### Baseline WAN Result on the Reference Path
+
+Two DigitalOcean droplets, HF bf16 reference runtime:
 
 | variant | TPS |
 |---|---:|
 | no-spec | 3.15 |
-| spec k=2 | 2.77 |
+| spec `k=2` | 2.77 |
 
-These are the numbers M3.5b (two-machine RPC over stock TCP-over-WireGuard) has
-to beat to justify the pivot.
+At that operating point, speculative decoding did not beat the non-speculative baseline.
 
-## Speculative pipelining decision gate
+### What These Results Mean
 
-The project now has a concrete kill/confirm gate for the speculative-pipelining
-thesis in [docs/EXPERIMENT_SPECULATIVE_PIPELINING.md](docs/EXPERIMENT_SPECULATIVE_PIPELINING.md).
-Before running the two-machine sweep, run the analytical model with measured
-Q4_K_M timings:
+The findings point to a cleaner research story:
 
-```bash
-./deploy/speculative_pipelining_model.py \
-  --verifier-ms <T_v> \
-  --draft-ms <T_d> \
-  --alpha-by-k 2:<alpha2>,4:<alpha4>,6:<alpha6> \
-  --rtts-ms 0,50,100,200,400
-```
+1. Kernel optimization is not the right place for Relay to differentiate.
+2. The relevant open problem is orchestration once efficient kernels exist.
+3. Speculative pipelining is only interesting if WAN latency becomes a material share of the round budget.
+4. The next empirical question is not "can we write faster kernels?" but "under what latency and heterogeneity regimes do runtime policies change throughput meaningfully?"
 
-It writes `prediction.csv`, `prediction.svg`, and `decision.json` under
-`logs/speculative-pipelining/model/`. The decision rule is intentionally simple:
-if pipelined spec does not beat no-spec anywhere at realistic latency, drop it
-from the llama.cpp orchestrator plan; if it beats both no-spec and vanilla spec
-by at least 20%, make speculative pipelining the central paper plot; otherwise
-escalate to a larger-model regime.
+## Experimental Methodology
 
-When empirical runs exist, log one row per run:
+Relay is intended to be experimentally grounded. The repository already includes local and multi-node harnesses for controlled runs, plus an analytical gate for speculative pipelining.
 
-```csv
-config,r_ms,seed,tps,draft_accept_pct
-no-spec,0,0,38.1,
-vanilla-spec,0,0,34.7,55.2
-pipelined-spec,0,0,36.9,55.2
-```
+### Measurement Principles
 
-Then summarize the sweep:
+- compare runtime variants under fixed prompts and seeds
+- separate kernel effects from orchestration effects
+- record topology and latency conditions explicitly
+- treat WAN RTT, jitter, and bandwidth as independent variables
+- write kill/confirm criteria before running speculative experiments
 
-```bash
-./deploy/speculative_pipelining_analyze.py logs/speculative-pipelining/runs.csv
-```
+### Current Speculative-Pipelining Gate
 
-The analyzer reads the Stage 0 model decision by default and only reports a
-confirmed result when the empirical threshold matches that prediction within
-~2x.
+The current decision framework is documented in [docs/EXPERIMENT_SPECULATIVE_PIPELINING.md](/Users/blakefullerton/Desktop/Code/PipeLineParralel/docs/EXPERIMENT_SPECULATIVE_PIPELINING.md). The working question is:
 
-The README should record only the latest `decision.json` outcome, the best RTT
-cell, median TPS with 95% CIs for the three configs, and a link to the run CSV.
+> Does hiding draft computation inside the verifier round-trip ever beat no-spec over realistic WAN latency?
 
-## Earlier per-token speculative results (HF, single machine)
-
-| variant | TPS | avg ms/token |
-|---|---:|---:|
-| no-spec | 7.27 | 137.6 |
-| spec k=2 | 6.53 | 153.2 |
-| spec k=6 | 5.54 | 180.4 |
-
-Speculative decoding does not currently beat no-spec on either backend. It is
-preserved at the application level for re-evaluation under the new compute regime,
-where the verifier wait shrinks and the WAN share of the round grows.
-
----
-
-# Architecture
-
-Relay is structured as a fixed-operation inference runtime. Trusted stages do not
-receive code, scripts, containers, plugins, or user-defined compute tasks. They
-only exchange authenticated runtime messages for activation transport, forward
-execution, KV-cache control, speculative verification, telemetry, and lifecycle
-coordination.
+The analytical model is intentionally simple:
 
 ```text
-Trusted control plane
-  - explicit stage membership
-  - shared cluster auth token / private network
-  - topology and latency observations
-  - no public peer admission
-
-Runtime data plane
-  Stage 0 ──activation/KV control──▶ Stage 1 ──...──▶ Stage N
-     ▲                                                   │
-     └──────────── speculative result / sampled token ───┘
-
-Allowed operations
-  - tensor transport
-  - stage-local forward pass
-  - KV cache trim/reset
-  - speculative decode verification
-  - pipeline routing and telemetry
+T_round(no-spec)        ~= T_v + R
+T_round(vanilla spec)   ~= T_d * k + T_v + R
+T_round(pipelined spec) ~= max(T_d * k, T_v + R)
 ```
 
-The current Python/HuggingFace path remains the reference implementation for
-experiments. The direction is to keep the operation vocabulary fixed while moving
-kernel execution to llama.cpp where it wins on CPU and Apple Silicon.
+That model exists to prevent post hoc storytelling. If no plausible crossover appears with measured Q4 timings, the mechanism should be dropped rather than defended rhetorically.
 
----
+## Why `llama.cpp`
 
-# Network Topology
+Relay uses `llama.cpp` because it empirically outperformed the project's hand-built HF path on the target hardware class, and because its design lines up with Relay's current scope:
 
-```text
-┌────────────────────────────────────────────┐
-│ Stage 0  (orchestrator + first half)      │
-│   draft model (small)                      │
-│   speculative scheduler                    │
-│   forward through local layers             │
-└──────────────────────┬─────────────────────┘
-                       │
-                       │ authenticated private WAN
-                       │ (WireGuard/Tailscale plus runtime HMAC)
-                       ▼
-┌────────────────────────────────────────────┐
-│ Stage N  (last layers)                    │
-│   complete forward                         │
-│   logits / sample                          │
-│   return to Stage 0                        │
-└────────────────────────────────────────────┘
+- strong CPU and Apple Silicon performance
+- mature quantized inference path
+- existing RPC support for layer partitioning
+- no need to re-solve quantization or low-level kernel scheduling inside Relay
+
+This is not a retreat from technical ambition. It is a narrowing of scope toward the part of the system that remains genuinely open: distributed runtime coordination over WAN links.
+
+## Security Model
+
+Relay assumes a **trusted cooperative cluster**, not public or permissionless participation.
+
+### Trust Boundary
+
+Nodes are expected to be:
+
+- explicitly configured
+- connected by a private overlay or equivalent trusted network path
+- authenticated at the runtime layer
+- operated by one person, one organization, or a trusted collaboration boundary
+
+### Supported Runtime Surface
+
+Relay is designed around inference-specific message types, not arbitrary execution. The intended operation set is limited to:
+
+- activation forwarding
+- cache control
+- speculative verification
+- telemetry
+- lifecycle coordination
+
+### Current Hardening Direction
+
+The repository already reflects several security-oriented corrections:
+
+- runtime traffic uses constrained message envelopes rather than raw Python object deserialization
+- authenticated runtime messaging is supported through shared trust configuration
+- peer discovery is no longer the default trusted deployment model
+
+Open hardening work remains, including stronger node identity, tighter bind policy, replay protection, and stricter payload validation. Those are engineering requirements for a trusted inference runtime, not optional polish.
+
+## Deployment and Reproducibility
+
+Relay includes deployment utilities for local and cloud experiments. The current deployment story is oriented around reproducible WAN-style measurements, not production serving.
+
+### Local Smoke Test
+
+```bash
+./deploy/run_local.py --config config.smoke.yaml --prompt "hello from localhost"
 ```
 
-Relay intentionally uses real inter-machine networking rather than localhost
-simulation to expose latency, serialization cost, bandwidth limits, packet
-overhead, and synchronization behavior that disappear on a single box.
+### Local Benchmark Matrix
 
----
+```bash
+./deploy/benchmark_matrix.py --base-config config.yaml --prompt "hello from localhost" --ks 1,2,4,6
+```
 
-# Why DigitalOcean?
+### HF Reference Baselines
 
-DigitalOcean droplets act as a reproducible WAN testbed. They are not the end
-goal.
+```bash
+./deploy/run_local.py --config bench_bf16_cpu.yaml --prompt "..."
+./deploy/run_local.py --config bench_bf16_mps.yaml --prompt "..."
+./deploy/run_local.py --config bench_int8_cpu.yaml --prompt "..."
+```
 
-The real target is geographically separate machines, different ISPs, different
-hardware, unreliable consumer networking. Cloud VMs simply make deployment,
-benchmarking, iteration, and instrumentation easier during development.
+### `llama.cpp` Local Kernel Reference
 
-WireGuard or Tailscale provides the encrypted overlay network. Relay adds a
-runtime message-authentication envelope on top so a node must be both reachable
-on the private network and configured with the shared cluster token.
+```bash
+llama-bench -hf unsloth/Llama-3.2-3B-Instruct-GGUF:Q4_K_M -ngl 0
+llama-bench -hf unsloth/Llama-3.2-3B-Instruct-GGUF:Q4_K_M
+```
 
----
+### `llama.cpp` Runtime Bring-Up
 
-# Project Structure
+Single-machine baseline:
+
+```bash
+.venv/bin/python deploy/llama_baseline.py \
+  --config config.llama.local.yaml \
+  --prompt "the future of distributed compute is"
+```
+
+Two-machine RPC planning:
+
+```bash
+.venv/bin/python deploy/llama_rpc_baseline.py plan
+.venv/bin/python deploy/llama_rpc_baseline.py doctor
+```
+
+Those commands are the bridge from the Python reference runtime to the active `llama.cpp`-backed direction.
+
+## Repository Layout
 
 ```text
 relay/
@@ -294,219 +363,60 @@ relay/
 │   ├── draft.py
 │   ├── utils.py
 │   └── dashboard.py
-│
 ├── deploy/
 │   ├── relayctl.py
-│   ├── deploy.sh
-│   ├── run.sh
 │   ├── run_local.py
 │   ├── benchmark_matrix.py
-│   └── teardown.sh
-│
+│   ├── llama_baseline.py
+│   └── llama_rpc_baseline.py
 ├── docs/
 │   ├── ARCHITECTURE_AUDIT.md
-│   └── PLAN.md           ← living research plan + decisions
-│
-├── bench_bf16_cpu.yaml   ← reproducible Path A diagnostic configs
-├── bench_bf16_mps.yaml
-├── bench_int8_cpu.yaml
-│
+│   ├── EXPERIMENT_SPECULATIVE_PIPELINING.md
+│   ├── PLAN.md
+│   └── README.md
 ├── config.yaml
 ├── config.smoke.yaml
 ├── config.nospec.yaml
-└── requirements.txt
+├── config.llama.local.yaml
+└── config.llama.rpc.yaml
 ```
 
----
+## Research Roadmap
 
-# Quick Start
+### Active
 
-## Prerequisites
+1. Complete the `llama.cpp`-backed two-machine RPC baseline on a trusted private network.
+2. Measure speculative pipelining under controlled injected RTT with pre-declared kill/confirm criteria.
+3. Build topology-aware orchestration around heterogeneous peers once the basic RPC path is established.
+4. Extend measurement from same-provider cloud baselines to multi-ISP WAN conditions.
 
-```bash
-brew install doctl wireguard-tools llama.cpp
-doctl auth init
-```
+### Deferred or Parked
 
-Create `deploy/.env`:
+- cascade and early-exit experiments, pending clarity on value under the `llama.cpp` execution model
+- custom transport replacement, unless the stock RPC transport proves to be load-bearing
+- deeper branching speculation variants before the single-chain speculative-pipelining question is resolved
 
-```bash
-DO_TOKEN=your_token
-GITHUB_REPO=youruser/relay
-DO_SSH_KEY=your_ssh_key
-HF_TOKEN=your_hf_token
-REGION=sfo3
-```
+## Non-Goals
 
----
+Relay is not trying to be:
 
-# Deploy WAN Nodes
+- a production serving framework
+- a generic cluster scheduler
+- a replacement for datacenter inference stacks
+- a public peer-compute fabric
+- a remote execution substrate
+- a claim that commodity WAN inference is universally efficient
 
-```bash
-./deploy/relayctl.py provision
-```
+The narrower goal is more credible: understand the practical limits of cooperative inference across trusted peers once realistic WAN conditions are part of the runtime model.
 
-This:
+## Long-Term Vision
 
-1. Creates droplets
-2. Configures WireGuard
-3. Clones the repo
-4. Installs dependencies
-5. Downloads model weights
-6. Bootstraps the pipeline environment
+The long-term ambition is technically broad but empirically grounded:
 
-Check deployment status:
+> investigate when cooperative inference across trusted WAN-connected machines is practical, when it is not, and which runtime policies determine that boundary.
 
-```bash
-./deploy/relayctl.py status
-./deploy/relayctl.py doctor
-```
+That includes negative results. If a technique fails outside datacenter conditions, Relay should be able to show that clearly. If a policy becomes useful only after kernel costs fall below a certain threshold, Relay should make that threshold measurable.
 
----
+In that sense, Relay is less a product thesis than a runtime-systems question:
 
-# Run Relay
-
-```bash
-./deploy/relayctl.py run \
-  --prompt "the future of computing is"
-```
-
----
-
-# Local Testing
-
-Smoke test:
-
-```bash
-./deploy/run_local.py \
-  --config config.smoke.yaml \
-  --prompt "hello from localhost"
-```
-
-Baseline run:
-
-```bash
-./deploy/run_local.py \
-  --config config.nospec.yaml \
-  --prompt "the future of computing is"
-```
-
-Benchmark matrix:
-
-```bash
-./deploy/benchmark_matrix.py \
-  --base-config config.yaml \
-  --ks 1,2,4,6
-```
-
-Path A diagnostic (reproducible):
-
-```bash
-./deploy/run_local.py --config bench_bf16_cpu.yaml --prompt "..."
-./deploy/run_local.py --config bench_bf16_mps.yaml --prompt "..."
-./deploy/run_local.py --config bench_int8_cpu.yaml --prompt "..."   # broken output expected
-```
-
-llama.cpp local kernel reference:
-
-```bash
-llama-bench -hf unsloth/Llama-3.2-3B-Instruct-GGUF:Q4_K_M -ngl 0   # CPU
-llama-bench -hf unsloth/Llama-3.2-3B-Instruct-GGUF:Q4_K_M          # Metal default
-```
-
----
-
-# Configuration
-
-```yaml
-pipeline:
-  num_stages: 2
-
-model:
-  name: "unsloth/Llama-3.2-3B"
-  arch: "llama"
-  dtype: "bfloat16"
-
-quantization:
-  weight_mode: "bf16"   # bf16 | int8 (Path A, dead) | q4_k_m (Path B, in progress)
-
-compression:
-  mode: "int8"          # legacy HF activation codec; ignored on llama.cpp path
-
-speculative:
-  enabled: false
-  k: 1
-  pipeline_prefetch: false
-
-cascade:
-  enabled: false        # parked: incompatible with llama.cpp whole-graph decode
-```
-
----
-
-# Research Directions
-
-**Active**
-
-1. **llama.cpp port (M3.5)** — single-machine `llama_decode` smoke first; then
-   `rpc-server` on a second WireGuard-connected machine, two-machine Q4_K_M
-   over stock TCP. The result decides whether a ZMQ transport replacement is
-   load-bearing.
-2. **Speculative pipelining over WAN** — characterize when next-round draft
-   prefetch wins as a function of RTT, draft acceptance rate, and verifier
-   round time. Becomes more relevant in the post-Q4 regime where WAN dominates.
-3. **Multi-ISP WAN measurement (M5)** — TPS vs RTT, jitter, packet loss,
-   asymmetric bandwidth across genuinely different ISPs (not same-region cloud).
-
-**Queued**
-
-* Tree speculation (EAGLE-2 / Medusa) at the application level.
-* Asymmetric-hardware orchestration (slow + fast machine, residential + cloud).
-* MoE expert sharding for WAN, after dense Q4 saturates (M4).
-
-**Parked**
-
-* Cascade / early exit — blocked by llama.cpp's whole-graph decode model, and
-  its value shrinks at 11× kernel speedup. Re-evaluate after M4.
-* Custom int8 activation codec — RTT was already negligible in the bf16 regime,
-  and llama.cpp's RPC handles fp16 activations with built-in framing.
-* From-scratch KV cache — better-managed by llama.cpp.
-
----
-
-# Non-Goals
-
-Relay is **not**:
-
-* a from-scratch inference engine — kernel work delegates to llama.cpp
-* a production inference framework
-* an open admission peer network
-* a remote code execution framework
-* a high-throughput serving system
-* a replacement for datacenter inference
-
-The current focus is systems research and empirical measurement of WAN-distributed
-LLM inference at the coordination layer.
-
----
-
-# Long-Term Vision
-
-Relay explores a broader possibility:
-
-> Large models may eventually run cooperatively across globally distributed
-> commodity hardware instead of only centralized clusters.
-
-Whether that becomes practical depends almost entirely on:
-
-* communication efficiency
-* scheduling
-* transport overhead
-* and distributed systems design.
-
-Relay exists to experimentally investigate those limits, on top of a kernel
-substrate that's already as fast as kernels get.
-
-<p align="center">
-  <b>Built on cheap hardware, open networks, and stubborn optimism ☕</b>
-</p>
+**What are the actual operating limits of WAN-distributed cooperative LLM inference?**
