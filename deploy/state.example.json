@@ -1,0 +1,17 @@
+{
+  "_comment": "Copy to state.json (gitignored) and fill in real values. public_ip is used for SSH from stage 0 to remote stages. wireguard_ip is used as the rpc-server endpoint that llama-bench --rpc connects to; if you do not run WireGuard, put the same address in both fields (e.g. a Tailscale 100.x address or a LAN IP).",
+  "stages": [
+    {
+      "stage": 0,
+      "hostname": "<stage0-hostname>",
+      "public_ip": "<stage0-ip>",
+      "wireguard_ip": "<stage0-ip>"
+    },
+    {
+      "stage": 1,
+      "hostname": "<stage1-hostname>",
+      "public_ip": "<stage1-ip>",
+      "wireguard_ip": "<stage1-ip>"
+    }
+  ]
+}

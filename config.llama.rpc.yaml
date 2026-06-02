@@ -14,7 +14,7 @@ rpc:
   remote_stage: 1
   port: 50052
   bind_host: "0.0.0.0"
-  ssh_user: "root"
+  ssh_user: "saturn"
   # Homebrew's llama.cpp formula currently installs llama-server and llama-bench
   # but not the standalone rpc-server tool. Point this at a source-built RPC
   # binary on the remote host once you have one.
