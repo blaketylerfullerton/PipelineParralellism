@@ -161,30 +161,13 @@ Stage 0
 
 ## Current Implementation State
 
-The repository currently contains two implementation paths:
-
-### 1. Python/HuggingFace Reference Runtime
-
-This is the original reference implementation and remains useful for experimentation:
-
-- model slicing across trusted stages
-- ZMQ-based activation transport
-- authenticated runtime envelopes
-- KV cache experiments
-- speculative decoding and cascade experiments
-- local and cloud benchmark tooling
-
-This path produced the original bf16 baselines and much of the empirical groundwork in the repository.
-
-### 2. `llama.cpp`-Backed Runtime Direction
-
-This is the active architectural direction:
+The repository is organized around a single active direction: a `llama.cpp`-backed runtime.
 
 - `llama.cpp` owns kernels, quantization, KV behavior, and RPC stage execution
-- Relay moves up-stack to orchestration and experimentation
-- the research focus shifts from "can we hand-build a fast inference path?" to "what runtime policies matter once kernels are already fast?"
+- Relay sits above that surface and owns orchestration, scheduling policy, and the experimental harness
+- the research focus is "what runtime policies matter once kernels are already fast?" rather than "can we hand-build a fast inference path?"
 
-That pivot is evidence-driven rather than cosmetic.
+An earlier Python/HuggingFace reference runtime (model slicing, ZMQ activation transport, hand-rolled int8 quant) produced the bf16 and dynamic-quant numbers in the comparison table below and was then removed once the kernel question closed. The pivot was evidence-driven; see [Current Findings](#current-findings).
 
 ## Current Findings
 
@@ -306,26 +289,6 @@ Open hardening work remains, including stronger node identity, tighter bind poli
 
 Relay includes deployment utilities for local and cloud experiments. The current deployment story is oriented around reproducible WAN-style measurements, not production serving.
 
-### Local Smoke Test
-
-```bash
-./deploy/run_local.py --config config.smoke.yaml --prompt "hello from localhost"
-```
-
-### Local Benchmark Matrix
-
-```bash
-./deploy/benchmark_matrix.py --base-config config.yaml --prompt "hello from localhost" --ks 1,2,4,6
-```
-
-### HF Reference Baselines
-
-```bash
-./deploy/run_local.py --config bench_bf16_cpu.yaml --prompt "..."
-./deploy/run_local.py --config bench_bf16_mps.yaml --prompt "..."
-./deploy/run_local.py --config bench_int8_cpu.yaml --prompt "..."
-```
-
 ### `llama.cpp` Local Kernel Reference
 
 ```bash
@@ -350,33 +313,22 @@ Two-machine RPC planning:
 .venv/bin/python deploy/llama_rpc_baseline.py doctor
 ```
 
-Those commands are the bridge from the Python reference runtime to the active `llama.cpp`-backed direction.
+Those commands drive the active `llama.cpp`-backed runtime.
 
 ## Repository Layout
 
 ```text
 relay/
 ├── src/
-│   ├── launch.py
-│   ├── worker.py
-│   ├── model.py
-│   ├── draft.py
-│   ├── utils.py
-│   └── dashboard.py
+│   └── speculative_pipelining.py   # analytical model + decision gate
 ├── deploy/
-│   ├── relayctl.py
-│   ├── run_local.py
-│   ├── benchmark_matrix.py
-│   ├── llama_baseline.py
-│   └── llama_rpc_baseline.py
+│   ├── llama_baseline.py           # single-machine llama.cpp baseline
+│   ├── llama_rpc_baseline.py       # two-machine RPC bring-up (plan/doctor/run)
+│   ├── speculative_pipelining_model.py     # predict-vs-baseline grid
+│   └── speculative_pipelining_analyze.py   # measured-vs-model comparison
 ├── docs/
-│   ├── ARCHITECTURE_AUDIT.md
-│   ├── EXPERIMENT_SPECULATIVE_PIPELINING.md
-│   ├── PLAN.md
-│   └── README.md
-├── config.yaml
-├── config.smoke.yaml
-├── config.nospec.yaml
+│   └── EXPERIMENT_SPECULATIVE_PIPELINING.md
+├── tests/
 ├── config.llama.local.yaml
 └── config.llama.rpc.yaml
 ```
