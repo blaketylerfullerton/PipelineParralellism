@@ -15,16 +15,16 @@ rpc:
   port: 50052
   bind_host: "0.0.0.0"
   ssh_user: "saturn"
-  # Homebrew's llama.cpp formula currently installs llama-server and llama-bench
-  # but not the standalone rpc-server tool. Point this at a source-built RPC
-  # binary on the remote host once you have one.
-  remote_binary: "/opt/llama.cpp-rpc/bin/rpc-server"
+  # Absolute path to rpc-server on the remote spark (source-built with
+  # -DGGML_RPC=ON). Must be reachable as the ssh_user above.
+  remote_binary: "/home/saturn/llama.cpp/build/bin/rpc-server"
   cache: true
   debug: true
   fit_off: true
 
 bench:
-  binary: "llama-bench"
+  # Absolute path to llama-bench on the orchestrator spark (spark-b0e1).
+  binary: "/home/blakefullerton/llama.cpp/build/bin/llama-bench"
   n_prompt: 0
   n_gen: 128
   repetitions: 3
