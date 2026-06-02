@@ -172,6 +172,10 @@ def cmd_doctor(config_path: Path, state_path: Path, ssh_check: bool) -> int:
     print(f"[ok] remote rpc command template: {remote_cmd}")
 
     if ssh_check:
+        import shlex
+
+        rpc_cfg = config.get("rpc", {}) or {}
+        remote_binary = str(rpc_cfg.get("remote_binary", "/opt/llama.cpp-rpc/bin/rpc-server"))
         ssh = [
             "ssh",
             "-o",
@@ -179,12 +183,12 @@ def cmd_doctor(config_path: Path, state_path: Path, ssh_check: bool) -> int:
             "-o",
             "ConnectTimeout=8",
             ssh_target,
-            "command -v rpc-server || test -x /opt/llama.cpp-rpc/bin/rpc-server",
+            f"test -x {shlex.quote(remote_binary)} && echo {shlex.quote(remote_binary)}",
         ]
         result = subprocess.run(ssh, text=True, capture_output=True, check=False)
         remote_ok = result.returncode == 0
-        detail = (result.stdout or result.stderr).strip()
-        print(f"[{'ok' if remote_ok else 'fail'}] remote rpc-server binary {detail}")
+        detail = (result.stdout or result.stderr).strip() or remote_binary
+        print(f"[{'ok' if remote_ok else 'fail'}] remote rpc-server binary: {detail}")
         ok &= remote_ok
 
     print(f"[ok] rpc endpoint: {_rpc_endpoint(config, state)}")
